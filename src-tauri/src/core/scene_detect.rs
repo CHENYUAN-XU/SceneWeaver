@@ -1,27 +1,39 @@
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::core::error::{AppError, AppResult};
-use crate::models::Segment;
+use crate::core::ffprobe::run_command_with_timeout;
+use crate::core::media_tools::MediaTool;
+use crate::models::{IndexProfile, Segment};
 
 const SCENE_THRESHOLD: &str = "0.30";
 const MIN_SHOT_DURATION_MS: i64 = 400;
 const MAX_BOUNDARIES: usize = 500;
 
-pub fn detect_shots(asset_id: &str, path: &Path, duration_ms: i64) -> AppResult<Vec<Segment>> {
-    let boundaries = match find_ffmpeg() {
-        Ok(ffmpeg) => run_scene_detection(&ffmpeg, path)?,
-        Err(_) => Vec::new(),
+pub fn detect_shots(
+    asset_id: &str,
+    path: &Path,
+    duration_ms: i64,
+    profile: &IndexProfile,
+) -> AppResult<Vec<Segment>> {
+    let boundaries = match MediaTool::Ffmpeg.find() {
+        Some(ffmpeg) => run_scene_detection(&ffmpeg, path, profile)?,
+        None => Vec::new(),
     };
     Ok(build_segments(asset_id, duration_ms, &boundaries))
 }
 
-fn run_scene_detection(ffmpeg: &str, path: &Path) -> AppResult<Vec<i64>> {
-    let filter = format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo");
+fn run_scene_detection(ffmpeg: &Path, path: &Path, profile: &IndexProfile) -> AppResult<Vec<i64>> {
+    let filter = match profile {
+        IndexProfile::Quick => {
+            format!("scale='min(320,iw)':-2,fps=5,select='gt(scene,{SCENE_THRESHOLD})',showinfo")
+        }
+        IndexProfile::Balanced => format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo"),
+        IndexProfile::Precise => "select='gt(scene,0.22)',showinfo".to_string(),
+    };
     let mut command = Command::new(ffmpeg);
     command
         .args(["-hide_banner", "-i"])
@@ -34,53 +46,6 @@ fn run_scene_detection(ffmpeg: &str, path: &Path) -> AppResult<Vec<i64>> {
         Duration::from_secs(90),
         "镜头检测超时（90 秒）；已终止 FFmpeg 子进程",
     )?;
-    if !output.status.success() {
-        return Err(AppError::Other("FFmpeg 镜头检测失败".to_string()));
-    }
-    Ok(parse_scene_timestamps(&String::from_utf8_lossy(
-        &output.stderr,
-    )))
-}
-
-fn run_command_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-    timeout_message: &str,
-) -> AppResult<Output> {
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(AppError::from);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::Other(timeout_message.to_string()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[allow(dead_code)]
-fn run_scene_detection_legacy(ffmpeg: &str, path: &Path) -> AppResult<Vec<i64>> {
-    let executable = ffmpeg.to_string();
-    let source = path.to_path_buf();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let filter = format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo");
-        let result = Command::new(executable)
-            .args(["-hide_banner", "-i"])
-            .arg(source)
-            .args(["-an", "-vf", &filter, "-f", "null", "-"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
-        let _ = sender.send(result);
-    });
-    let output = receiver
-        .recv_timeout(Duration::from_secs(90))
-        .map_err(|_| AppError::Other("镜头检测超时（90 秒）".to_string()))??;
     if !output.status.success() {
         return Err(AppError::Other("FFmpeg 镜头检测失败".to_string()));
     }
@@ -143,15 +108,6 @@ pub fn build_segments(asset_id: &str, duration_ms: i64, boundaries: &[i64]) -> V
             }
         })
         .collect()
-}
-
-fn find_ffmpeg() -> AppResult<String> {
-    which::which("ffmpeg")
-        .or_else(|_| which::which("ffmpeg.exe"))
-        .map(|path| path.to_string_lossy().to_string())
-        .map_err(|_| {
-            AppError::FfprobeUnavailable("未找到 FFmpeg，视频将保留为完整片段".to_string())
-        })
 }
 
 #[cfg(test)]

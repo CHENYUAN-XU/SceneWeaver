@@ -94,6 +94,29 @@ pub struct Job {
     pub updated_at: i64,
 }
 
+impl Job {
+    pub fn scan(library_id: String, step: &str, priority: i32) -> Self {
+        let now = chrono::Utc::now().timestamp_millis();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_type: JobType::Scan,
+            library_id: Some(library_id),
+            asset_id: None,
+            status: JobStatus::Pending,
+            priority,
+            progress: 0.0,
+            current_step: step.to_string(),
+            checkpoint_json: None,
+            error_code: None,
+            error_message: None,
+            started_at: None,
+            finished_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ScanProgress {

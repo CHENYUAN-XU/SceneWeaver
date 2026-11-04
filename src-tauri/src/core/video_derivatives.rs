@@ -1,13 +1,14 @@
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::core::cache::CacheManager;
 use crate::core::error::{AppError, AppResult};
-use crate::models::Segment;
+use crate::core::ffprobe::run_command_with_timeout;
+use crate::core::media_tools::MediaTool;
+use crate::models::{IndexProfile, Segment};
 
 const MAX_PREVIEW_DURATION_MS: i64 = 6_000;
 const MAX_DERIVATIVE_SEGMENTS: usize = 120;
@@ -23,8 +24,9 @@ pub fn generate_for_segments(
     source: &Path,
     asset_id: &str,
     segments: &mut [Segment],
+    profile: &IndexProfile,
 ) -> AppResult<bool> {
-    let Ok(ffmpeg) = find_ffmpeg() else {
+    let Some(ffmpeg) = MediaTool::Ffmpeg.find() else {
         return Ok(false);
     };
     for segment in segments.iter_mut().take(MAX_DERIVATIVE_SEGMENTS) {
@@ -39,8 +41,35 @@ pub fn generate_for_segments(
             &preview_args(segment.start_ms, segment.duration_ms, &preview),
         )?;
 
-        let (black_frame_score, blur_score, quality_score, subtitle_present, game_ui) =
-            quality_metrics(&keyframe)?;
+        let mut metrics = quality_metrics(&keyframe)?;
+        if *profile == IndexProfile::Precise && segment.duration_ms >= 1_200 {
+            let extra_frame = keyframe.with_file_name(format!("sample-{}.jpg", segment.id));
+            let mut samples = 1.0;
+            for offset in [segment.duration_ms / 4, segment.duration_ms * 3 / 4] {
+                let timestamp = segment.start_ms + offset;
+                if timestamp.abs_diff(timestamp_ms) < 150 {
+                    continue;
+                }
+                let result = run_ffmpeg(&ffmpeg, source, &keyframe_args(timestamp, &extra_frame))
+                    .and_then(|()| quality_metrics(&extra_frame));
+                let _ = std::fs::remove_file(&extra_frame);
+                match result {
+                    Ok(sample) => {
+                        samples += 1.0;
+                        metrics.0 += sample.0;
+                        metrics.1 += sample.1;
+                        metrics.2 += sample.2;
+                        metrics.3 |= sample.3;
+                        metrics.4 |= sample.4;
+                    }
+                    Err(error) => log::warn!("额外代表帧分析失败: {error}"),
+                }
+            }
+            metrics.0 /= samples;
+            metrics.1 /= samples;
+            metrics.2 /= samples;
+        }
+        let (black_frame_score, blur_score, quality_score, subtitle_present, game_ui) = metrics;
         let now = Utc::now().timestamp_millis();
         segment.representative_frame_path = Some(keyframe.to_string_lossy().to_string());
         segment.thumbnail_path = Some(keyframe.to_string_lossy().to_string());
@@ -53,14 +82,6 @@ pub fn generate_for_segments(
         segment.updated_at = now;
     }
     Ok(true)
-}
-
-fn find_ffmpeg() -> AppResult<PathBuf> {
-    which::which("ffmpeg")
-        .or_else(|_| which::which("ffmpeg.exe"))
-        .map_err(|_| {
-            AppError::FfprobeUnavailable("未找到 FFmpeg，无法生成视频关键帧和预览".to_string())
-        })
 }
 
 fn run_ffmpeg(executable: &Path, source: &Path, args: &[String]) -> AppResult<()> {
@@ -81,61 +102,6 @@ fn run_ffmpeg(executable: &Path, source: &Path, args: &[String]) -> AppResult<()
         PROCESS_TIMEOUT,
         "视频派生文件生成超时（90 秒）；已终止 FFmpeg 子进程",
     )?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let details = String::from_utf8_lossy(&output.stderr);
-        let message = details.lines().last().unwrap_or("未知 FFmpeg 错误");
-        Err(AppError::Other(format!(
-            "FFmpeg 生成视频预览失败: {message}"
-        )))
-    }
-}
-
-fn run_command_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-    timeout_message: &str,
-) -> AppResult<Output> {
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(AppError::from);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::Other(timeout_message.to_string()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[allow(dead_code)]
-fn run_ffmpeg_legacy(executable: &Path, source: &Path, args: &[String]) -> AppResult<()> {
-    if let Some(parent) = args.last().and_then(|output| Path::new(output).parent()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let executable = executable.to_path_buf();
-    let source = source.to_path_buf();
-    let args = args.to_vec();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = Command::new(executable)
-            .arg("-hide_banner")
-            .arg("-y")
-            .arg("-i")
-            .arg(source)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
-        let _ = sender.send(result);
-    });
-    let output = receiver
-        .recv_timeout(PROCESS_TIMEOUT)
-        .map_err(|_| AppError::Other("视频派生文件生成超时（90 秒）".to_string()))??;
     if output.status.success() {
         Ok(())
     } else {

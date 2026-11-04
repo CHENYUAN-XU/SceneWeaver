@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "vendor/ffmpeg/": "media-tools/"
+    }
+  }
+}

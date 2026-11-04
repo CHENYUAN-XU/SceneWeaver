@@ -1,7 +1,7 @@
 use std::path::Path;
 #[cfg(feature = "webdriver-e2e")]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
@@ -14,6 +14,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub cache: Arc<CacheManager>,
     pub job_queue: Arc<JobQueue>,
+    pub text_analysis: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -33,11 +34,13 @@ impl AppState {
             app_handle,
         ));
         job_queue.recover()?;
+        super::library_watch::start(Arc::clone(&db), Arc::downgrade(&job_queue));
 
         Ok(Self {
             db,
             cache,
             job_queue,
+            text_analysis: Arc::new(Mutex::new(())),
         })
     }
 }

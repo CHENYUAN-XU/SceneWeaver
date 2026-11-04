@@ -2,12 +2,15 @@ import { useParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { addSegmentToDefaultSelects, addSegmentToSelectCollection, copyToClipboard, getLibrary, listAssets, listSegments, listSelectCollections, segmentPreviewDataUrl } from '@/api';
 import { MediaGrid } from '@/components/MediaGrid';
+import { AssetTextPanel } from '@/components/AssetTextPanel';
 import { formatDuration, formatTimecode } from '@/lib/mediaFormat';
 import { useState } from 'react';
+import type { Asset } from '@/types';
 
 export default function LibraryDetail() {
   const { id } = useParams<{ id: string }>();
   const [segmentAssetId, setSegmentAssetId] = useState<string | null>(null);
+  const [textAsset, setTextAsset] = useState<Asset | null>(null);
   const { data: library, isLoading: libLoading } = useQuery({
     queryKey: ['library', id],
     queryFn: () => getLibrary(id!),
@@ -45,9 +48,10 @@ export default function LibraryDetail() {
       {assetsLoading ? (
         <p className="text-neutral-500">加载媒体中…</p>
       ) : (
-        <MediaGrid assets={assets ?? []} onViewSegments={setSegmentAssetId} />
+        <MediaGrid assets={assets ?? []} onViewSegments={setSegmentAssetId} onViewText={setTextAsset} />
       )}
       {segmentAssetId && <section className="mt-8 rounded-xl border bg-white p-4 dark:bg-neutral-950"><div className="mb-3 flex items-center justify-between"><h2 className="font-semibold">镜头片段</h2><button onClick={() => setSegmentAssetId(null)} className="text-sm text-neutral-500">关闭</button></div>{segmentsLoading && <p className="text-sm text-neutral-500">加载片段中…</p>}{segments?.length === 0 && <p className="text-sm text-neutral-500">尚未切分镜头。请先在对应视频卡片点击“切分”。</p>}<div className="space-y-3">{segments?.map((segment) => <SegmentCard key={segment.id} assetId={segmentAssetId} segment={segment} collections={selectCollections ?? []} />)}</div></section>}
+      {textAsset && <AssetTextPanel key={textAsset.id} asset={textAsset} onClose={() => setTextAsset(null)} />}
     </div>
   );
 }

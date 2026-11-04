@@ -50,5 +50,31 @@ fn main() {
     // webview2-com-sys dependency before that validation, so packaging is
     // reproducible and the installed EXE keeps its adjacent loader DLL.
     prepare_webview2_loader();
-    tauri_build::build()
+    tauri_build::build();
+    #[cfg(target_os = "windows")]
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        prepare_gnu_test_resources();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_gnu_test_resources() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"));
+    // Tauri's GNU resource is a COFF object despite the .a extension. Only
+    // binary targets receive it automatically, so wrap it for the lib tests.
+    let archive = output.join("libsceneweaver_test_resources.a");
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(&archive)
+        .arg(output.join("libresource.a"))
+        .status()
+        .expect("start MinGW ar");
+    assert!(
+        status.success(),
+        "archive the Windows manifest for lib tests"
+    );
+    println!("cargo:rustc-link-search=native={}", output.display());
 }

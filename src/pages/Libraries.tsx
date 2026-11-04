@@ -2,14 +2,21 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Link } from 'react-router-dom';
-import { createLibrary, listJobs, listLibraries, reconnectLibrary, startScan } from '@/api';
-import type { Job, Library } from '@/types';
+import { createLibrary, listJobs, listLibraries, reconnectLibrary, setLibraryWatchEnabled, startScan } from '@/api';
+import type { IndexProfile, Job, Library } from '@/types';
+
+const profileNames: Record<IndexProfile, string> = {
+  quick: '快速',
+  balanced: '平衡',
+  precise: '精确',
+};
 
 export default function Libraries() {
   const queryClient = useQueryClient();
   const { data: libraries, isLoading } = useQuery({
     queryKey: ['libraries'],
     queryFn: listLibraries,
+    refetchInterval: 5000,
   });
   const { data: jobs } = useQuery({
     queryKey: ['jobs'],
@@ -18,6 +25,7 @@ export default function Libraries() {
   });
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
+  const [profile, setProfile] = useState<IndexProfile>('balanced');
   const [reconnectMessage, setReconnectMessage] = useState('');
 
   const createMutation = useMutation({
@@ -35,6 +43,12 @@ export default function Libraries() {
       queryClient.invalidateQueries({ queryKey: ['libraries'] });
       queryClient.invalidateQueries({ queryKey: ['jobs'] });
     },
+  });
+
+  const watchMutation = useMutation({
+    mutationFn: ({ libraryId, enabled }: { libraryId: string; enabled: boolean }) =>
+      setLibraryWatchEnabled(libraryId, enabled),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['libraries'] }),
   });
 
   const reconnectMutation = useMutation({
@@ -63,7 +77,7 @@ export default function Libraries() {
     createMutation.mutate({
       name: name.trim(),
       root_path: path.trim(),
-      index_profile: 'balanced',
+      index_profile: profile,
     });
   };
 
@@ -114,6 +128,16 @@ export default function Libraries() {
               选择
             </button>
           </div>
+          <select
+            aria-label="索引模式"
+            value={profile}
+            onChange={(event) => setProfile(event.target.value as IndexProfile)}
+            className="rounded-lg border border-neutral-300 px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900"
+          >
+            <option value="quick">快速（低频采样）</option>
+            <option value="balanced">平衡（逐帧切分）</option>
+            <option value="precise">精确（多帧质量分析）</option>
+          </select>
           <button
             onClick={handleCreate}
             disabled={createMutation.isPending || !name.trim() || !path.trim()}
@@ -140,6 +164,9 @@ export default function Libraries() {
           无法启动扫描：{scanMutation.error?.message ?? '未知错误'}
         </p>
       )}
+      {watchMutation.isError && (
+        <p role="alert" className="mb-4 text-sm text-red-600">自动扫描设置失败：{watchMutation.error.message}</p>
+      )}
 
       {isLoading ? (
         <p className="text-neutral-500">加载中…</p>
@@ -159,6 +186,8 @@ export default function Libraries() {
               onReconnect={() => reconnect(lib)}
               isReconnecting={reconnectMutation.isPending && reconnectMutation.variables?.library_id === lib.id}
               hasActiveScan={activeScanLibraryIds.has(lib.id)}
+              onWatchChange={(enabled) => watchMutation.mutate({ libraryId: lib.id, enabled })}
+              watchPending={watchMutation.isPending && watchMutation.variables?.libraryId === lib.id}
             />
           ))}
         </div>
@@ -174,6 +203,8 @@ function LibraryCard({
   onReconnect,
   isReconnecting,
   hasActiveScan,
+  onWatchChange,
+  watchPending,
 }: {
   library: Library;
   onScan: () => void;
@@ -181,6 +212,8 @@ function LibraryCard({
   onReconnect: () => void;
   isReconnecting: boolean;
   hasActiveScan: boolean;
+  onWatchChange: (enabled: boolean) => void;
+  watchPending: boolean;
 }) {
   return (
     <div className="rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950">
@@ -193,6 +226,19 @@ function LibraryCard({
       <p className="mb-3 truncate text-sm text-neutral-500" title={library.root_path}>
         {library.root_path}
       </p>
+      <div className="mb-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-neutral-500">
+        <span>索引模式 · {profileNames[library.index_profile]}</span>
+        <label className="flex items-center gap-1" title="应用运行时监测素材变化，文件稳定后自动增量扫描。">
+          <input
+            type="checkbox"
+            data-testid={`watch-library-${library.id}`}
+            checked={library.watch_enabled}
+            disabled={watchPending}
+            onChange={(event) => onWatchChange(event.target.checked)}
+          />
+          自动增量扫描
+        </label>
+      </div>
       <div className="flex flex-wrap gap-2">
         <button
           data-testid={`scan-library-${library.id}`}

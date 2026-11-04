@@ -5,7 +5,7 @@ use crate::core::app_state::AppState;
 use crate::core::error::AppResult;
 use crate::core::scanner::{default_exclude_patterns, default_include_patterns, normalize_path};
 use crate::models::{
-    CreateLibraryRequest, IndexProfile, Job, JobStatus, JobType, Library, LibraryStatus,
+    CreateLibraryRequest, IndexProfile, Job, JobStatus, Library, LibraryStatus,
     ReconnectLibraryRequest, ReconnectLibraryResult,
 };
 
@@ -67,6 +67,17 @@ pub async fn start_scan(state: State<'_, AppState>, library_id: String) -> AppRe
 }
 
 #[tauri::command]
+pub async fn set_library_watch_enabled(
+    state: State<'_, AppState>,
+    library_id: String,
+    enabled: bool,
+) -> AppResult<()> {
+    state
+        .job_queue
+        .set_library_watch_enabled(&library_id, enabled)
+}
+
+#[tauri::command]
 pub async fn reconnect_library(
     state: State<'_, AppState>,
     req: ReconnectLibraryRequest,
@@ -79,15 +90,7 @@ pub async fn reconnect_library(
     }
     let root = dunce::canonicalize(requested_root)
         .map_err(|_| crate::core::error::AppError::InvalidPath(requested_root.to_path_buf()))?;
-    let (library, rebased_assets, offline_assets) =
-        state.db.reconnect_library_root(&req.library_id, &root)?;
-    let job = enqueue_scan(&state, library.id.clone())?;
-    Ok(ReconnectLibraryResult {
-        library,
-        job,
-        rebased_assets,
-        offline_assets,
-    })
+    state.job_queue.reconnect_library(&req.library_id, &root)
 }
 
 fn enqueue_scan(state: &AppState, library_id: String) -> AppResult<Job> {
@@ -113,25 +116,7 @@ fn enqueue_scan(state: &AppState, library_id: String) -> AppResult<Job> {
         )));
     }
 
-    let now = Utc::now().timestamp_millis();
-    let job = Job {
-        id: uuid::Uuid::new_v4().to_string(),
-        job_type: JobType::Scan,
-        library_id: Some(library_id),
-        asset_id: None,
-        status: JobStatus::Pending,
-        priority: 10,
-        progress: 0.0,
-        current_step: "等待扫描".to_string(),
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        started_at: None,
-        finished_at: None,
-        created_at: now,
-        updated_at: now,
-    };
-
-    state.job_queue.submit(job.clone())?;
-    Ok(job)
+    state
+        .job_queue
+        .submit(Job::scan(library_id, "等待扫描", 10))
 }

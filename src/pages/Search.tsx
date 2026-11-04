@@ -4,12 +4,13 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { addAssetsToDefaultSelects, addAssetsToSelectCollection, findAssetsForEntity, findSimilarAssets, findSimilarByReferenceImage, hiddenAssetIds, listEntities, listSelectCollections, recentSearches, searchAssets, setAssetHidden } from '@/api';
 import { MediaGrid } from '@/components/MediaGrid';
 import { SegmentPanel } from '@/components/SegmentPanel';
+import { AssetTextPanel } from '@/components/AssetTextPanel';
 import { parseQueryConditions, replaceQueryCondition } from '@/lib/queryConditions';
 import { ACG_CREATOR_PRESETS, applyAcgCreatorPack } from '@/lib/acgCreatorPack';
 import { assetMatchesDateRange, dateInputBoundary } from '@/lib/dateRange';
 import { acgCreatorPackEnabled } from '@/api';
 import { useQuery } from '@tanstack/react-query';
-import type { MediaType, SearchRequest } from '@/types';
+import type { Asset, MediaType, SearchRequest } from '@/types';
 
 type ViteImportMeta = ImportMeta & { env?: { DEV?: boolean } };
 
@@ -19,7 +20,6 @@ export default function Search() {
   const similar = useMutation({ mutationFn: findSimilarAssets });
   const referenceImage = useMutation({ mutationFn: findSimilarByReferenceImage });
   const entityMatches = useMutation({ mutationFn: findAssetsForEntity });
-  const [similarReference, setSimilarReference] = useState<string | null>(null);
   const [conditions, setConditions] = useState<SearchRequest | null>(null);
   const [mediaTypes, setMediaTypes] = useState<MediaType[]>([]);
   const [minQuality, setMinQuality] = useState<number | null>(null);
@@ -27,6 +27,7 @@ export default function Search() {
   const [dateEnd, setDateEnd] = useState('');
   const [entityId, setEntityId] = useState('');
   const [segmentFocus, setSegmentFocus] = useState<{ assetId: string; matchingSegmentIds?: string[] } | null>(null);
+  const [textAsset, setTextAsset] = useState<Asset | null>(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(new Set());
   const [batchCollectionId, setBatchCollectionId] = useState('default');
   const batchSelects = useMutation({
@@ -44,21 +45,33 @@ export default function Search() {
   const dateEndMs = dateInputBoundary(dateEnd, 'end');
   const invalidDateRange = dateStartMs !== null && dateEndMs !== null && dateStartMs > dateEndMs;
 
+  const clearResults = () => {
+    search.reset();
+    similar.reset();
+    referenceImage.reset();
+    entityMatches.reset();
+    setConditions(null);
+    setSegmentFocus(null);
+    setTextAsset(null);
+    setSelectedAssetIds(new Set());
+  };
+  const runKeywordSearch = (conditions: SearchRequest) => {
+    if (invalidDateRange) return;
+    const request = {
+      ...conditions,
+      media_types: mediaTypes,
+      min_quality_score: minQuality,
+      date_start_ms: dateStartMs,
+      date_end_ms: dateEndMs,
+    };
+    clearResults();
+    setConditions(request);
+    search.mutate(request);
+  };
   const runQuery = (rawQuery: string) => {
-    if (rawQuery.trim()) {
-      const parsed = parseQueryConditions(rawQuery.trim());
-      similar.reset(); entityMatches.reset(); setSimilarReference(null); setSegmentFocus(null); setSelectedAssetIds(new Set());
-      if (invalidDateRange) return;
-      const request = {
-        ...(acgPack.data ? applyAcgCreatorPack(parsed) : parsed),
-        media_types: mediaTypes,
-        min_quality_score: minQuality,
-        date_start_ms: dateStartMs,
-        date_end_ms: dateEndMs,
-      };
-      setConditions(request);
-      search.mutate(request);
-    }
+    if (!rawQuery.trim()) return;
+    const parsed = parseQueryConditions(rawQuery.trim());
+    runKeywordSearch(acgPack.data ? applyAcgCreatorPack(parsed) : parsed);
   };
   const submit = (event: React.FormEvent) => { event.preventDefault(); runQuery(query); };
   const chooseReferenceImage = async () => {
@@ -66,30 +79,34 @@ export default function Search() {
       ? (window as Window & { __SCENEWEAVER_E2E_REFERENCE_IMAGE_PATH__?: string }).__SCENEWEAVER_E2E_REFERENCE_IMAGE_PATH__
       : undefined;
     const path = e2eReferencePath ?? await open({ multiple: false, filters: [{ name: '图片', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'] }] });
-    if (typeof path === 'string') { setSimilarReference(path); search.reset(); similar.reset(); entityMatches.reset(); setSegmentFocus(null); setSelectedAssetIds(new Set()); referenceImage.mutate(path); }
+    if (typeof path === 'string') {
+      clearResults();
+      referenceImage.mutate(path);
+    }
   };
   const searchEntity = () => {
     if (!entityId) return;
-    search.reset(); similar.reset(); referenceImage.reset(); setSimilarReference(null); setSegmentFocus(null); setSelectedAssetIds(new Set());
+    clearResults();
     entityMatches.mutate(entityId);
   };
   const keywordAssets = search.data?.map((result) => result.asset) ?? [];
   const keywordExplanations = Object.fromEntries((search.data ?? []).map((result) => [result.asset.id, { reasons: result.match_reasons, unmet: result.unmet_should }]));
   const keywordMatchingSegments = Object.fromEntries((search.data ?? []).map((result) => [result.asset.id, result.matching_segment_ids]));
-  const activeEntity = entities.data?.find((entity) => entity.id === entityId);
+  const activeEntity = entities.data?.find((entity) => entity.id === entityMatches.variables);
   const entityExplanations = Object.fromEntries((entityMatches.data ?? []).map((asset) => [asset.id, { reasons: [`本地实体匹配：${activeEntity?.name ?? '已选实体'}（名称、别名或正参考图）`], unmet: [] }]));
   const activeAssets = (entityMatches.data ?? referenceImage.data ?? similar.data ?? keywordAssets)
     .filter((asset) => !hiddenAssets.data?.includes(asset.id))
     .filter((asset) => assetMatchesDateRange(asset, dateStartMs, dateEndMs));
+  const selectedResultIds = activeAssets.filter((asset) => selectedAssetIds.has(asset.id)).map((asset) => asset.id);
   const removeCondition = (kind: 'must' | 'should' | 'must_not', term: string) => {
     if (!conditions) return;
     const request = { ...conditions, [kind]: conditions[kind].filter((value) => value !== term) };
-    setConditions(request); search.mutate(request);
+    runKeywordSearch(request);
   };
   const editCondition = (kind: 'must' | 'should' | 'must_not', term: string, replacement: string) => {
     if (!conditions || !replacement.trim() || replacement.trim() === term) return;
     const request = replaceQueryCondition(conditions, kind, term, replacement);
-    setConditions(request); search.mutate(request);
+    runKeywordSearch(request);
   };
   const toggleMediaType = (mediaType: MediaType) => setMediaTypes((current) => current.includes(mediaType) ? current.filter((value) => value !== mediaType) : [...current, mediaType]);
 
@@ -137,12 +154,13 @@ export default function Search() {
         </div>
       )}
       {(search.isError || similar.isError || referenceImage.isError || entityMatches.isError) && <p className="mb-4 text-sm text-red-600">搜索失败：{(entityMatches.error ?? referenceImage.error ?? similar.error ?? search.error)?.message}</p>}
-      {(search.data || similar.data || referenceImage.data || entityMatches.data) && <div className="mb-4 flex items-center gap-3 text-sm text-neutral-500"><span>{entityMatches.data ? '实体匹配结果' : referenceImage.data ? '参考图相似结果' : similarReference ? '视觉相似结果' : '关键词结果'}：{activeAssets.length} 项</span>{activeAssets.length > 0 && <button type="button" onClick={() => setSelectedAssetIds(new Set(activeAssets.map((asset) => asset.id)))} className="rounded border px-2 py-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800">全选当前结果</button>}</div>}
+      {(search.data || similar.data || referenceImage.data || entityMatches.data) && <div className="mb-4 flex items-center gap-3 text-sm text-neutral-500"><span>{entityMatches.data ? '实体匹配结果' : referenceImage.data ? '参考图相似结果' : similar.data ? '视觉相似结果' : '关键词结果'}：{activeAssets.length} 项</span>{activeAssets.length > 0 && <button type="button" onClick={() => setSelectedAssetIds(new Set(activeAssets.map((asset) => asset.id)))} className="rounded border px-2 py-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800">全选当前结果</button>}</div>}
       {!!hiddenAssets.data?.length && <div className="mb-3 flex items-center gap-2 text-xs text-neutral-500"><span>已在搜索中隐藏 {hiddenAssets.data.length} 项</span><button type="button" onClick={() => Promise.all(hiddenAssets.data!.map((assetId) => setAssetHidden(assetId, false))).then(() => hiddenAssets.refetch())} className="rounded border px-2 py-1">恢复全部</button></div>}
-      {selectedAssetIds.size > 0 && <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm text-brand-800"><span>已选择 {selectedAssetIds.size} 项</span><label className="flex items-center gap-1">加入<select value={batchCollectionId} onChange={(event) => setBatchCollectionId(event.target.value)} className="rounded border border-brand-200 bg-white px-2 py-1 text-sm text-neutral-800"><option value="default">我的选片（默认）</option>{selectCollections.data?.filter((collection) => collection.name !== '我的选片').map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select></label><button onClick={() => batchSelects.mutate({ assetIds: [...selectedAssetIds], collectionId: batchCollectionId })} disabled={batchSelects.isPending} className="rounded bg-brand-600 px-3 py-1 text-white disabled:opacity-50">{batchSelects.isPending ? '加入中…' : '批量加入选片'}</button><button onClick={() => setSelectedAssetIds(new Set())} className="rounded border px-3 py-1">取消选择</button></div>}
+      {selectedResultIds.length > 0 && <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm text-brand-800"><span>已选择 {selectedResultIds.length} 项</span><label className="flex items-center gap-1">加入<select value={batchCollectionId} onChange={(event) => setBatchCollectionId(event.target.value)} className="rounded border border-brand-200 bg-white px-2 py-1 text-sm text-neutral-800"><option value="default">我的选片（默认）</option>{selectCollections.data?.filter((collection) => collection.name !== '我的选片').map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select></label><button onClick={() => batchSelects.mutate({ assetIds: selectedResultIds, collectionId: batchCollectionId })} disabled={batchSelects.isPending} className="rounded bg-brand-600 px-3 py-1 text-white disabled:opacity-50">{batchSelects.isPending ? '加入中…' : '批量加入选片'}</button><button onClick={() => setSelectedAssetIds(new Set())} className="rounded border px-3 py-1">取消选择</button></div>}
       {batchSelects.isError && <p className="mb-3 text-sm text-red-600">批量加入选片失败：{batchSelects.error.message}</p>}
-      {(search.data || similar.data || referenceImage.data || entityMatches.data) && <MediaGrid assets={activeAssets} explanations={entityMatches.data ? entityExplanations : referenceImage.data || similar.data ? undefined : keywordExplanations} matchingSegments={referenceImage.data || similar.data || entityMatches.data ? undefined : keywordMatchingSegments} selectedAssetIds={selectedAssetIds} onToggleSelection={(assetId) => setSelectedAssetIds((current) => { const next = new Set(current); if (next.has(assetId)) next.delete(assetId); else next.add(assetId); return next; })} onHide={(assetId) => setAssetHidden(assetId, true).then(() => hiddenAssets.refetch())} onViewSegments={(assetId, matchingSegmentIds) => setSegmentFocus({ assetId, matchingSegmentIds })} onFindSimilar={(assetId) => { setSimilarReference(assetId); referenceImage.reset(); entityMatches.reset(); setSegmentFocus(null); similar.mutate(assetId); }} />}
+      {(search.data || similar.data || referenceImage.data || entityMatches.data) && <MediaGrid assets={activeAssets} onViewText={setTextAsset} explanations={entityMatches.data ? entityExplanations : referenceImage.data || similar.data ? undefined : keywordExplanations} matchingSegments={referenceImage.data || similar.data || entityMatches.data ? undefined : keywordMatchingSegments} selectedAssetIds={selectedAssetIds} onToggleSelection={(assetId) => setSelectedAssetIds((current) => { const next = new Set(current); if (next.has(assetId)) next.delete(assetId); else next.add(assetId); return next; })} onHide={(assetId) => setAssetHidden(assetId, true).then(() => hiddenAssets.refetch())} onViewSegments={(assetId, matchingSegmentIds) => setSegmentFocus({ assetId, matchingSegmentIds })} onFindSimilar={(assetId) => { clearResults(); similar.mutate(assetId); }} />}
       {segmentFocus && <SegmentPanel assetId={segmentFocus.assetId} matchingSegmentIds={segmentFocus.matchingSegmentIds} onClose={() => setSegmentFocus(null)} />}
+      {textAsset && <AssetTextPanel key={textAsset.id} asset={textAsset} onClose={() => setTextAsset(null)} />}
     </div>
   );
 }

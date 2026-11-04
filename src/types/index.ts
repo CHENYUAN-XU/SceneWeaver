@@ -1,5 +1,12 @@
 export type LibraryStatus = 'idle' | 'scanning' | 'paused' | 'error';
 export type IndexProfile = 'quick' | 'balanced' | 'precise';
+export type AssetTextSource = 'ocr' | 'speech';
+
+export interface TextCue {
+  text: string;
+  start_ms: number | null;
+  end_ms: number | null;
+}
 export type MediaType = 'image' | 'video' | 'audio';
 export type AssetStatus = 'pending' | 'indexed' | 'error' | 'offline';
 export type JobStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,24 +53,18 @@ impl Scanner {
         let scan_marker = Utc::now().timestamp_millis();
         let mut processed = 0usize;
         let mut summary = ScanSummary::default();
+        let mut traversal_failed = false;
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| !is_hidden(e))
         {
-            if control.is_cancelled() {
-                return Err(AppError::Cancelled);
-            }
-            while control.is_paused() && !control.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            if control.is_cancelled() {
-                return Err(AppError::Cancelled);
-            }
+            wait_for_scan_control(control)?;
 
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
+                    traversal_failed = true;
                     summary.errors += 1;
                     log::warn!("跳过无法访问的路径: {error}");
                     continue;
@@ -91,7 +86,7 @@ impl Scanner {
                 path.file_name().unwrap_or_default().to_string_lossy()
             ));
 
-            match self.process_file(library, path, &library.index_profile, scan_marker) {
+            match self.process_file(library, path, scan_marker) {
                 Ok(change) => {
                     if change {
                         summary.changed += 1;
@@ -102,6 +97,8 @@ impl Scanner {
                 Err(e) => {
                     summary.errors += 1;
                     log::error!("处理文件失败 {}: {:?}", path.display(), e);
+                    self.db
+                        .mark_asset_seen(&library.id, &normalize_path(path), scan_marker)?;
                 }
             }
 
@@ -118,10 +115,13 @@ impl Scanner {
             );
         }
 
+        wait_for_scan_control(control)?;
         // 本次扫描中未出现的素材才标记为离线，不保存整库路径到内存。
-        summary.removed = self
-            .db
-            .mark_unseen_assets_offline(&library.id, scan_marker)?;
+        if !traversal_failed {
+            summary.removed = self
+                .db
+                .mark_unseen_assets_offline(&library.id, scan_marker)?;
+        }
 
         Ok(summary)
     }
@@ -139,12 +139,7 @@ impl Scanner {
             .into_iter()
             .filter_entry(|entry| !is_hidden(entry))
         {
-            if control.is_cancelled() {
-                return Err(AppError::Cancelled);
-            }
-            while control.is_paused() && !control.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
+            wait_for_scan_control(control)?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -163,13 +158,7 @@ impl Scanner {
         Ok(total)
     }
 
-    fn process_file(
-        &self,
-        library: &Library,
-        path: &Path,
-        _profile: &IndexProfile,
-        scan_marker: i64,
-    ) -> AppResult<bool> {
+    fn process_file(&self, library: &Library, path: &Path, scan_marker: i64) -> AppResult<bool> {
         let meta = fs::metadata(path)?;
         let modified = meta
             .modified()?
@@ -280,7 +269,7 @@ impl Scanner {
 
         self.db.create_or_update_asset(&asset)?;
         if media_type == MediaType::Video {
-            self.index_video_derivatives(&asset, path);
+            self.index_video_derivatives(&asset, path, &library.index_profile);
         }
         let embedding_source = match media_type {
             MediaType::Image => Some(path.to_path_buf()),
@@ -310,24 +299,29 @@ impl Scanner {
     /// indexed representation, not a UI-only action. Failure remains
     /// non-fatal: the source asset and its metadata stay searchable, and the
     /// user can retry manual shot detection after fixing FFmpeg.
-    fn index_video_derivatives(&self, asset: &Asset, source: &Path) {
+    fn index_video_derivatives(&self, asset: &Asset, source: &Path, profile: &IndexProfile) {
         let Some(duration_ms) = asset.duration_ms else {
             log::warn!("跳过视频片段派生：时长未知 {}", source.display());
             return;
         };
-        let mut segments =
-            match crate::core::scene_detect::detect_shots(&asset.id, source, duration_ms) {
-                Ok(segments) => segments,
-                Err(error) => {
-                    log::warn!("视频镜头检测降级 {}: {error}", source.display());
-                    return;
-                }
-            };
+        let mut segments = match crate::core::scene_detect::detect_shots(
+            &asset.id,
+            source,
+            duration_ms,
+            profile,
+        ) {
+            Ok(segments) => segments,
+            Err(error) => {
+                log::warn!("视频镜头检测降级 {}: {error}", source.display());
+                return;
+            }
+        };
         if let Err(error) = crate::core::video_derivatives::generate_for_segments(
             &self.cache,
             source,
             &asset.id,
             &mut segments,
+            profile,
         ) {
             log::warn!("视频关键帧/预览派生降级 {}: {error}", source.display());
         }
@@ -335,6 +329,44 @@ impl Scanner {
             log::warn!("持久化视频镜头片段失败 {}: {error}", source.display());
         }
     }
+}
+
+pub(super) fn media_snapshot(library: &Library) -> AppResult<MediaSnapshot> {
+    let root = Path::new(&library.root_path);
+    let include = build_globset(&library.include_patterns);
+    let exclude = build_globset(&library.exclude_patterns);
+    let mut files = HashMap::new();
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden(entry))
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        if entry.file_type().is_file()
+            && is_media_file(path)
+            && matches_patterns(relative, &include, &exclude)
+        {
+            let metadata = entry.metadata()?;
+            files.insert(
+                relative.to_path_buf(),
+                (metadata.len(), metadata.modified()?),
+            );
+        }
+    }
+    Ok(files)
+}
+
+pub(super) type MediaSnapshot = HashMap<PathBuf, (u64, std::time::SystemTime)>;
+
+fn wait_for_scan_control(control: &JobControl) -> AppResult<()> {
+    while control.is_paused() && !control.is_cancelled() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if control.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
 }
 
 fn existing_id(library_id: &str, normalized_path: &str, db: &Database) -> AppResult<String> {

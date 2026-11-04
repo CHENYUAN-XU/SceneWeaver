@@ -52,18 +52,25 @@ pub async fn detect_asset_shots(
         crate::core::error::AppError::Other("视频时长未知，无法切分镜头".to_string())
     })?;
     let asset_for_worker = asset.clone();
+    let profile = state
+        .db
+        .get_library(&asset.library_id)?
+        .map(|library| library.index_profile)
+        .unwrap_or(crate::models::IndexProfile::Balanced);
     let cache = std::sync::Arc::clone(&state.cache);
     let segments = tokio::task::spawn_blocking(move || {
         let mut segments = crate::core::scene_detect::detect_shots(
             &asset_for_worker.id,
             std::path::Path::new(&asset_for_worker.file_path),
             duration,
+            &profile,
         )?;
         crate::core::video_derivatives::generate_for_segments(
             &cache,
             std::path::Path::new(&asset_for_worker.file_path),
             &asset_for_worker.id,
             &mut segments,
+            &profile,
         )?;
         Ok::<_, crate::core::error::AppError>(segments)
     })
@@ -262,6 +269,7 @@ pub async fn search_assets(
     for result in &mut results {
         let acg_tags = state.db.asset_acg_tags(&result.asset.id)?;
         apply_acg_tag_explanations(result, &request, &acg_tags);
+        apply_text_explanations(&state, result, &request)?;
         let segments = state.db.list_segments(&result.asset.id)?;
         apply_segment_label_explanations(result, &request, &segments);
         result.matching_segment_ids = matching_segment_ids(&request, &segments);
@@ -358,6 +366,46 @@ fn diversity_order(library_ids: &[String]) -> Vec<usize> {
         }
     }
     order
+}
+
+fn apply_text_explanations(
+    state: &AppState,
+    result: &mut crate::models::SearchResult,
+    request: &crate::models::SearchRequest,
+) -> AppResult<()> {
+    use crate::models::AssetTextSource::{Ocr, Speech};
+    for (source, label) in [(Ocr, "画面文字"), (Speech, "语音转写")] {
+        let cues = state.db.list_asset_text(&result.asset.id, source)?;
+        if cues.is_empty() {
+            continue;
+        }
+        for (term, weight) in request
+            .must
+            .iter()
+            .map(|term| (term, 2.0))
+            .chain(request.should.iter().map(|term| (term, 1.0)))
+        {
+            let lowered = term.to_lowercase();
+            if let Some(cue) = cues
+                .iter()
+                .find(|cue| cue.text.to_lowercase().contains(&lowered))
+            {
+                let location = cue
+                    .start_ms
+                    .map(|start| format!("（{}）", crate::core::export::timecode(start)))
+                    .unwrap_or_default();
+                result
+                    .match_reasons
+                    .retain(|reason| reason != "按关键词召回");
+                result
+                    .match_reasons
+                    .push(format!("命中{label}：{term}{location}"));
+                result.unmet_should.retain(|unmet| unmet != term);
+                result.score += weight;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_acg_tag_explanations(

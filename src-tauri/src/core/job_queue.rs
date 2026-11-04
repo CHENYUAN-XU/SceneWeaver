@@ -12,7 +12,7 @@ use crate::core::cache::CacheManager;
 use crate::core::db::Database;
 use crate::core::error::{AppError, AppResult};
 use crate::core::scanner::Scanner;
-use crate::models::{Job, JobStatus, JobType, LibraryStatus, ScanProgress};
+use crate::models::{Job, JobStatus, JobType, LibraryStatus, ReconnectLibraryResult, ScanProgress};
 
 pub trait ProgressUpdate: Send + Sync {
     fn report_progress(&self, progress: f64, processed: i64, total: i64, errors: i64);
@@ -90,6 +90,64 @@ impl JobQueue {
     }
 
     pub fn submit(&self, job: Job) -> AppResult<Job> {
+        let _controls = self.controls.lock().unwrap();
+        self.submit_locked(job)
+    }
+
+    pub fn set_library_watch_enabled(&self, library_id: &str, enabled: bool) -> AppResult<()> {
+        let _controls = self.controls.lock().unwrap();
+        self.db.set_library_watch_enabled(library_id, enabled)
+    }
+
+    pub fn reconnect_library(
+        &self,
+        library_id: &str,
+        root: &std::path::Path,
+    ) -> AppResult<ReconnectLibraryResult> {
+        let _controls = self.controls.lock().unwrap();
+        let (library, rebased_assets, offline_assets) =
+            self.db.reconnect_library_root(library_id, root)?;
+        let job = self.submit_locked(Job::scan(library.id.clone(), "等待扫描", 10))?;
+        Ok(ReconnectLibraryResult {
+            library,
+            job,
+            rebased_assets,
+            offline_assets,
+        })
+    }
+
+    pub(super) fn submit_watched_scan(
+        &self,
+        library_id: &str,
+        expected_root: &str,
+    ) -> AppResult<bool> {
+        let _controls = self.controls.lock().unwrap();
+        let Some(library) = self.db.get_library(library_id)? else {
+            return Ok(true);
+        };
+        if !library.watch_enabled || library.root_path != expected_root {
+            return Ok(true);
+        }
+        if self.db.active_scan_job_for_library(library_id)?.is_some() {
+            return Ok(false);
+        }
+        self.submit_locked(Job::scan(library.id, "等待自动增量扫描", 0))?;
+        Ok(true)
+    }
+
+    fn submit_locked(&self, job: Job) -> AppResult<Job> {
+        if let Some(library_id) = job
+            .library_id
+            .as_deref()
+            .filter(|_| job.job_type == JobType::Scan)
+        {
+            if let Some(existing) = self.db.active_scan_job_for_library(library_id)? {
+                return Err(AppError::Other(format!(
+                    "素材库已有扫描任务（{}）",
+                    existing.id
+                )));
+            }
+        }
         self.db.create_job(&job)?;
         self.start_loop();
         Ok(job)
@@ -97,11 +155,6 @@ impl JobQueue {
 
     pub fn pause_job(&self, job_id: &str) -> AppResult<Job> {
         let controls = self.controls.lock().unwrap();
-        if let Some(control) = controls.get(job_id) {
-            control.pause();
-        }
-        drop(controls);
-
         let mut job = self
             .db
             .get_job(job_id)?
@@ -110,6 +163,9 @@ impl JobQueue {
             job.status = JobStatus::Paused;
             job.updated_at = Utc::now().timestamp_millis();
             self.db.update_job(&job)?;
+            if let Some(control) = controls.get(job_id) {
+                control.pause();
+            }
             if let Some(library_id) = &job.library_id {
                 self.db
                     .update_library_status(library_id, LibraryStatus::Paused, None)?;
@@ -120,22 +176,27 @@ impl JobQueue {
 
     pub fn resume_job(&self, job_id: &str) -> AppResult<Job> {
         let controls = self.controls.lock().unwrap();
-        if let Some(control) = controls.get(job_id) {
-            control.resume();
-        }
-        drop(controls);
-
         let mut job = self
             .db
             .get_job(job_id)?
             .ok_or_else(|| AppError::JobNotFound(job_id.to_string()))?;
         if job.status == JobStatus::Paused {
-            job.status = JobStatus::Pending;
+            let control = controls.get(job_id);
+            let library_status = if control.is_some() {
+                job.status = JobStatus::Running;
+                LibraryStatus::Scanning
+            } else {
+                job.status = JobStatus::Pending;
+                LibraryStatus::Idle
+            };
             job.updated_at = Utc::now().timestamp_millis();
             self.db.update_job(&job)?;
+            if let Some(control) = control {
+                control.resume();
+            }
             if let Some(library_id) = &job.library_id {
                 self.db
-                    .update_library_status(library_id, LibraryStatus::Idle, None)?;
+                    .update_library_status(library_id, library_status, None)?;
             }
         }
         self.start_loop();
@@ -144,11 +205,6 @@ impl JobQueue {
 
     pub fn cancel_job(&self, job_id: &str) -> AppResult<Job> {
         let controls = self.controls.lock().unwrap();
-        if let Some(control) = controls.get(job_id) {
-            control.cancel();
-        }
-        drop(controls);
-
         let mut job = self
             .db
             .get_job(job_id)?
@@ -161,6 +217,9 @@ impl JobQueue {
             job.finished_at = Some(Utc::now().timestamp_millis());
             job.updated_at = Utc::now().timestamp_millis();
             self.db.update_job(&job)?;
+            if let Some(control) = controls.get(job_id) {
+                control.cancel();
+            }
             if let Some(library_id) = &job.library_id {
                 self.db
                     .update_library_status(library_id, LibraryStatus::Idle, None)?;
@@ -221,6 +280,8 @@ impl JobQueue {
 
         thread::spawn(move || {
             loop {
+                // Coordinate worker shutdown and job claims with submit/resume/cancel.
+                let mut active_controls = controls.lock().unwrap();
                 let next = {
                     match db.list_active_jobs() {
                         Ok(mut jobs) => {
@@ -244,55 +305,62 @@ impl JobQueue {
                 };
 
                 let control = JobControl::new();
-                {
-                    let mut map = controls.lock().unwrap();
-                    map.insert(
-                        job.id.clone(),
-                        JobControl {
-                            cancelled: control.cancelled.clone(),
-                            paused: control.paused.clone(),
-                        },
-                    );
-                }
-
                 job.status = JobStatus::Running;
                 job.started_at = Some(Utc::now().timestamp_millis());
                 job.updated_at = Utc::now().timestamp_millis();
                 if let Err(e) = db.update_job(&job) {
                     log::error!("更新任务状态失败: {:?}", e);
-                    continue;
+                    running.store(false, Ordering::SeqCst);
+                    break;
                 }
+                active_controls.insert(
+                    job.id.clone(),
+                    JobControl {
+                        cancelled: control.cancelled.clone(),
+                        paused: control.paused.clone(),
+                    },
+                );
+                if let Some(library_id) = job
+                    .library_id
+                    .as_deref()
+                    .filter(|_| job.job_type == JobType::Scan)
+                {
+                    if let Err(e) =
+                        db.update_library_status(library_id, LibraryStatus::Scanning, None)
+                    {
+                        log::error!("更新素材库状态失败: {:?}", e);
+                    }
+                }
+                drop(active_controls);
 
                 let progress_emitter = TauriProgressEmitter {
                     app: app.clone(),
                     db: Arc::clone(&db),
+                    controls: Arc::clone(&controls),
                     job_id: job.id.clone(),
                     library_id: job.library_id.clone().unwrap_or_default(),
                 };
 
                 let result = match job.job_type {
-                    JobType::Scan => {
-                        if let Some(library_id) = &job.library_id {
-                            if let Err(e) =
-                                db.update_library_status(library_id, LibraryStatus::Scanning, None)
-                            {
-                                log::error!("更新素材库状态失败: {:?}", e);
-                            }
-                        }
-                        run_scan_job(&db, &cache, &job, &control, &progress_emitter)
-                    }
+                    JobType::Scan => run_scan_job(&db, &cache, &job, &control, &progress_emitter),
                     _ => {
                         // 其他类型任务暂按完成处理
                         Ok(())
                     }
                 };
 
+                let mut active_controls = controls.lock().unwrap();
                 let mut final_job = db
                     .get_job(&job.id)
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| job.clone());
 
+                let result = if control.is_cancelled() {
+                    Err(AppError::Cancelled)
+                } else {
+                    result
+                };
                 match result {
                     Ok(_) => {
                         final_job.status = JobStatus::Completed;
@@ -336,10 +404,7 @@ impl JobQueue {
                     log::error!("持久化最终任务状态失败: {:?}", e);
                 }
 
-                {
-                    let mut map = controls.lock().unwrap();
-                    map.remove(&final_job.id);
-                }
+                active_controls.remove(&final_job.id);
 
                 let metrics = scan_metrics(&final_job.checkpoint_json);
                 let _ = progress_emitter.app.emit(
@@ -355,6 +420,7 @@ impl JobQueue {
                         errors: metrics.errors,
                     },
                 );
+                drop(active_controls);
 
                 thread::sleep(Duration::from_millis(100));
             }
@@ -385,13 +451,14 @@ fn run_scan_job(
 struct TauriProgressEmitter {
     app: tauri::AppHandle,
     db: Arc<Database>,
+    controls: Arc<Mutex<HashMap<String, JobControl>>>,
     job_id: String,
     library_id: String,
 }
 
 impl ProgressUpdate for TauriProgressEmitter {
     fn report_progress(&self, progress: f64, processed: i64, total: i64, errors: i64) {
-        self.persist(
+        self.publish(
             Some(progress),
             None,
             Some(ScanMetrics {
@@ -400,41 +467,15 @@ impl ProgressUpdate for TauriProgressEmitter {
                 errors,
             }),
         );
-        let _ = self.app.emit(
-            "scan:progress",
-            ScanProgress {
-                job_id: self.job_id.clone(),
-                library_id: self.library_id.clone(),
-                status: JobStatus::Running,
-                progress,
-                current_step: String::new(),
-                processed,
-                total,
-                errors,
-            },
-        );
     }
 
     fn report_step(&self, step: String) {
-        self.persist(None, Some(&step), None);
-        let _ = self.app.emit(
-            "scan:progress",
-            ScanProgress {
-                job_id: self.job_id.clone(),
-                library_id: self.library_id.clone(),
-                status: JobStatus::Running,
-                progress: -1.0,
-                current_step: step,
-                processed: 0,
-                total: 0,
-                errors: 0,
-            },
-        );
+        self.publish(None, Some(&step), None);
     }
 
     fn report_total(&self, total: i64) {
         let step = format!("发现 {} 个文件", total);
-        self.persist(
+        self.publish(
             Some(0.0),
             Some(&step),
             Some(ScanMetrics {
@@ -443,27 +484,18 @@ impl ProgressUpdate for TauriProgressEmitter {
                 errors: 0,
             }),
         );
-        let _ = self.app.emit(
-            "scan:progress",
-            ScanProgress {
-                job_id: self.job_id.clone(),
-                library_id: self.library_id.clone(),
-                status: JobStatus::Running,
-                progress: 0.0,
-                current_step: step,
-                processed: 0,
-                total,
-                errors: 0,
-            },
-        );
     }
 }
 
 impl TauriProgressEmitter {
-    fn persist(&self, progress: Option<f64>, step: Option<&str>, metrics: Option<ScanMetrics>) {
+    fn publish(&self, progress: Option<f64>, step: Option<&str>, metrics: Option<ScanMetrics>) {
+        let _controls = self.controls.lock().unwrap();
         let Ok(Some(mut job)) = self.db.get_job(&self.job_id) else {
             return;
         };
+        if job.status == JobStatus::Cancelled {
+            return;
+        }
         if let Some(progress) = progress {
             job.progress = progress.clamp(0.0, 1.0);
         }
@@ -477,6 +509,20 @@ impl TauriProgressEmitter {
         if let Err(error) = self.db.update_job(&job) {
             log::warn!("持久化任务进度失败: {error}");
         }
+        let metrics = scan_metrics(&job.checkpoint_json);
+        let _ = self.app.emit(
+            "scan:progress",
+            ScanProgress {
+                job_id: self.job_id.clone(),
+                library_id: self.library_id.clone(),
+                status: job.status,
+                progress: job.progress,
+                current_step: job.current_step,
+                processed: metrics.processed,
+                total: metrics.total,
+                errors: metrics.errors,
+            },
+        );
     }
 }
 

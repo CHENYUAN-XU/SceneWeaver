@@ -6,6 +6,7 @@ pub mod job;
 pub mod library;
 pub mod selects;
 pub mod system;
+pub mod text;
 
 pub fn register_commands() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static
 {
@@ -15,6 +16,7 @@ pub fn register_commands() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + 
         library::get_library,
         library::delete_library,
         library::start_scan,
+        library::set_library_watch_enabled,
         library::reconnect_library,
         asset::list_assets,
         asset::get_asset,
@@ -26,6 +28,9 @@ pub fn register_commands() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + 
         asset::list_asset_acg_tags,
         asset::remove_asset_acg_tag,
         asset::search_assets,
+        text::list_asset_text,
+        text::analyze_asset_text,
+        text::delete_asset_text,
         asset::find_similar_assets,
         asset::find_similar_by_reference_image,
         asset::recent_searches,

@@ -29,6 +29,7 @@ export default function Jobs() {
     mutationFn: retryJob,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs'] }),
   });
+  const actionError = pause.error ?? resume.error ?? cancel.error ?? retry.error;
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -59,6 +60,7 @@ export default function Jobs() {
   return (
     <div className="p-8">
       <h1 className="mb-6 text-2xl font-bold">任务中心</h1>
+      {actionError && <p role="alert" className="mb-3 text-sm text-red-600">任务操作失败：{actionError.message}</p>}
       {isLoading ? (
         <p className="text-neutral-500">加载中…</p>
       ) : jobs?.length === 0 ? (

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sceneweaver_lib::core::cache::CacheManager;
 use sceneweaver_lib::core::db::Database;
+use sceneweaver_lib::core::error::AppError;
 use sceneweaver_lib::core::export::{
     write_csv, write_edl, write_fcpxml, write_json, write_select_contact_sheet_html,
     write_select_contact_sheet_png, write_select_items_csv, write_select_items_edl,
@@ -10,8 +11,8 @@ use sceneweaver_lib::core::export::{
 use sceneweaver_lib::core::job_queue::{JobControl, ProgressUpdate};
 use sceneweaver_lib::core::scanner::Scanner;
 use sceneweaver_lib::models::{
-    Entity, EntityReference, IndexProfile, Job, JobStatus, JobType, Library, LibraryStatus,
-    SearchRequest, SelectCollection, UpdateSelectItemRequest,
+    AssetTextSource, Entity, EntityReference, IndexProfile, Job, JobStatus, JobType, Library,
+    LibraryStatus, SearchRequest, SelectCollection, UpdateSelectItemRequest,
 };
 
 struct SilentProgress;
@@ -22,7 +23,23 @@ impl ProgressUpdate for SilentProgress {
     fn report_total(&self, _total: i64) {}
 }
 
+struct CancelAfterLastFile<'a>(&'a JobControl);
+
+impl ProgressUpdate for CancelAfterLastFile<'_> {
+    fn report_progress(&self, _progress: f64, processed: i64, total: i64, _errors: i64) {
+        if processed == total {
+            self.0.cancel();
+        }
+    }
+    fn report_step(&self, _step: String) {}
+    fn report_total(&self, _total: i64) {}
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--sleep-for-timeout-test") {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
     let root = std::env::temp_dir().join(format!("sceneweaver-smoke-{}", uuid::Uuid::new_v4()));
     let media_root = root.join("中文 素材库");
     std::fs::create_dir_all(&media_root)?;
@@ -243,18 +260,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control = JobControl::new();
     let progress = SilentProgress;
 
-    let mut slow_probe = std::process::Command::new("ping");
+    let mut slow_probe = std::process::Command::new(std::env::current_exe()?);
     slow_probe
-        .args(["127.0.0.1", "-n", "4"])
+        .arg("--sleep-for-timeout-test")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let timeout_started = std::time::Instant::now();
-    assert!(sceneweaver_lib::core::ffprobe::run_command_with_timeout(
-        &mut slow_probe,
-        std::time::Duration::from_millis(100),
-        "smoke timeout",
-    )
-    .is_err());
+    assert!(matches!(
+        sceneweaver_lib::core::ffprobe::run_command_with_timeout(
+            &mut slow_probe,
+            std::time::Duration::from_millis(100),
+            "smoke timeout",
+        ),
+        Err(AppError::FfprobeUnavailable(message)) if message == "smoke timeout"
+    ));
     assert!(
         timeout_started.elapsed() < std::time::Duration::from_secs(2),
         "timed-out probe must be terminated rather than continue in background"
@@ -427,7 +446,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(schema_version, 9);
+    assert_eq!(schema_version, 10);
+    let text_cues = sceneweaver_lib::core::text_analysis::parse_srt(
+        "0\r\n00:00:01,250 --> 00:00:03,000\r\n灯塔 lighthouse_100%\r\n\r\n",
+    );
+    assert_eq!(text_cues[0].start_ms, Some(1_250));
+    db.store_asset_text(&primary_asset, AssetTextSource::Speech, &text_cues)?;
+    let mut text_request = SearchRequest {
+        raw_query: String::new(),
+        must: vec!["lighthouse_100%".into()],
+        should: vec![],
+        must_not: vec![],
+        media_types: vec![],
+        min_quality_score: None,
+        date_start_ms: None,
+        date_end_ms: None,
+    };
+    assert_eq!(
+        reopened.search_assets_with_conditions(&text_request, 10)?[0].id,
+        primary_asset.id
+    );
+    text_request.must_not.append(&mut text_request.must);
+    assert!(reopened
+        .assets_matching_nonsemantic_filters(&text_request, 100)?
+        .iter()
+        .all(|asset| asset.id != primary_asset.id));
     let reopened_embedding_count: i64 = rusqlite::Connection::open(root.join("sceneweaver.db"))?
         .query_row(
             "SELECT COUNT(*) FROM asset_embeddings WHERE asset_id = ?1",
@@ -628,7 +671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fcpxml = std::fs::read_to_string(&fcpxml_path)?;
     assert!(fcpxml.contains("<fcpxml"));
     assert!(fcpxml.contains("%E4%B8%AD%E6%96%87"));
-    assert!(fcpxml.contains("hasVideo=\"1\"/>"));
+    assert!(fcpxml.contains("hasVideo=\"1\"><media-rep kind=\"original-media\" src=\"file:"));
     assert!(fcpxml.contains("id=\"format-timeline\""));
     assert!(fcpxml.contains("id=\"asset-1\""));
     assert!(fcpxml.contains("ref=\"asset-1\""));
@@ -755,6 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(range_fcpxml.contains("start=\"1000/1000s\""));
     assert!(range_fcpxml.contains("frameDuration=\"1001/24000s\""));
     assert!(range_fcpxml.contains("format=\"format-asset-1\""));
+    assert!(range_fcpxml.contains("<media-rep kind=\"original-media\""));
     let contact_sheet_path = root.join("range-selects.png");
     write_select_contact_sheet_png(&contact_sheet_path, &range_items, &cache)?;
     assert_eq!(image::open(&contact_sheet_path)?.width(), 1_000);
@@ -805,6 +849,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(std::time::Duration::from_millis(20));
     image::RgbImage::from_pixel(48, 27, image::Rgb([56, 34, 12])).save(&image_path)?;
     let changed = scanner.scan_library(&library, &control, &progress)?;
+    assert!(db
+        .list_asset_text(&primary_asset.id, AssetTextSource::Speech)?
+        .is_empty());
     let changed_asset = db
         .list_assets(&library.id)?
         .into_iter()
@@ -840,6 +887,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     std::fs::remove_file(&image_path)?;
+    let cancel_control = JobControl::new();
+    assert!(matches!(
+        scanner.scan_library(
+            &library,
+            &cancel_control,
+            &CancelAfterLastFile(&cancel_control)
+        ),
+        Err(AppError::Cancelled)
+    ));
+    assert_eq!(
+        db.get_asset(&primary_asset.id)?
+            .expect("original asset")
+            .status,
+        sceneweaver_lib::models::AssetStatus::Indexed
+    );
     let third = scanner.scan_library(&library, &control, &progress)?;
     assert_eq!(third.removed, 1);
     assert_eq!(
@@ -935,6 +997,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         assert!(video_asset.duration_ms.unwrap_or(0) >= 1_900);
         assert_eq!(video_asset.capture_time, Some(1_714_979_289_000));
+        let precise_id = uuid::Uuid::new_v4().to_string();
+        let mut precise_segments = sceneweaver_lib::core::scene_detect::build_segments(
+            &precise_id,
+            video_asset.duration_ms.unwrap(),
+            &[],
+        );
+        assert!(
+            sceneweaver_lib::core::video_derivatives::generate_for_segments(
+                &cache,
+                &video_path,
+                &precise_id,
+                &mut precise_segments,
+                &IndexProfile::Precise,
+            )?
+        );
+        assert!(precise_segments[0].quality_score.is_some());
+        assert!(
+            !std::fs::read_dir(cache.root().join("keyframes"))?.any(|entry| {
+                entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("sample-"))
+            })
+        );
         let mut video_segments = db.list_segments(&video_asset.id)?;
         assert!(!video_segments.is_empty(), "video must create segments");
         assert!(video_segments

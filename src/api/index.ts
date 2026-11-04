@@ -1,6 +1,8 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type {
   Asset,
+  AssetTextSource,
+  TextCue,
   CreateLibraryRequest,
   Job,
   Library,
@@ -11,6 +13,20 @@ import type {
   Entity, EntityReference, CreateEntityRequest, SelectCollection, CreateSelectCollectionRequest, SelectItem, UpdateSelectItemRequest,
   ReconnectLibraryRequest, ReconnectLibraryResult,
 } from '@/types';
+
+async function invoke<T>(...args: Parameters<typeof tauriInvoke>): Promise<T> {
+  try {
+    return await tauriInvoke<T>(...args);
+  } catch (cause) {
+    if (cause instanceof Error) throw cause;
+    // Tauri rejects with raw strings or a serialized Rust AppError variant.
+    const message = typeof cause === 'string' ? cause
+      : cause && typeof cause === 'object'
+        ? Object.values(cause).find((value): value is string => typeof value === 'string')
+        : undefined;
+    throw new Error(message || `调用失败（${args[0]}）`);
+  }
+}
 
 // Libraries
 export const createLibrary = (req: CreateLibraryRequest): Promise<Library> =>
@@ -26,6 +42,9 @@ export const deleteLibrary = (id: string): Promise<void> =>
 
 export const startScan = (libraryId: string): Promise<Job> =>
   invoke('start_scan', { libraryId });
+
+export const setLibraryWatchEnabled = (libraryId: string, enabled: boolean): Promise<void> =>
+  invoke('set_library_watch_enabled', { libraryId, enabled });
 
 export const reconnectLibrary = (req: ReconnectLibraryRequest): Promise<ReconnectLibraryResult> =>
   invoke('reconnect_library', { req });
@@ -51,6 +70,15 @@ export const listAssets = (libraryId: string): Promise<Asset[]> =>
 
 export const getAsset = (id: string): Promise<Asset | null> =>
   invoke('get_asset', { id });
+
+export const listAssetText = (assetId: string, source: AssetTextSource): Promise<TextCue[]> =>
+  invoke('list_asset_text', { assetId, source });
+
+export const analyzeAssetText = (assetId: string, source: AssetTextSource, language: string, modelPath: string | null): Promise<TextCue[]> =>
+  invoke('analyze_asset_text', { assetId, source, language, modelPath });
+
+export const deleteAssetText = (assetId: string, source: AssetTextSource): Promise<void> =>
+  invoke('delete_asset_text', { assetId, source });
 
 export const listSegments = (assetId: string): Promise<Segment[]> =>
   invoke('list_segments', { assetId });

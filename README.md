@@ -1,5 +1,9 @@
 # SceneWeaver
 
+> **项目状态 · 阶段性收尾（2026-11-04）**。v0.1.0 保留为 Windows 桌面预览，项目暂缓主动开发。安装方式、验证范围和恢复开发事项见 [阶段收尾说明](./docs/HANDOFF.md)。
+
+> 2026-11-04 更新：素材库可启用自动增量扫描。快速、平衡、精确索引分别采用低频采样、逐帧镜头检测和多帧质量分析。素材卡片的“文字”面板支持按需调用本机 Tesseract 或带 whisper 滤镜的 FFmpeg，持久化文字和时间码供搜索，详见 [项目进度](./docs/PROGRESS.md)。
+
 > 2026-07-19 更新：素材库卡片新增“重新连接”。当素材库移动、盘符变化或外接盘重新挂载时，选择新的根目录即可自动启动增量扫描；相对路径仍一致的文件会保留资产 ID、缩略图、分析结果、Entity 关联和 Selects，找不到的文件会明确标为离线。该操作只更新本地 SQLite 路径记录，绝不移动、删除或上传源媒体。
 
 > 扫描队列会拒绝同一素材库的重复 `pending`、`running` 或 `paused` 扫描；暂停任务须恢复或取消后才能重新提交，避免并行扫描覆盖进度或产生多余派生文件。
@@ -71,7 +75,7 @@ FCPXML 导出会对 Windows 路径中的中文、空格和保留字符生成规�
 - 本地核心：Rust
 - 业务数据库：SQLite（WAL 模式）
 - 向量索引：LanceDB / SQLite 向量扩展（阶段 3 接入）
-- 媒体处理：FFmpeg / ffprobe（当前开发版优先检测 PATH；发布版将打包为侧车）
+- 媒体处理：FFmpeg / ffprobe（默认使用本机工具，打包时可选随应用分发）
 
 ## 开发环境要求
 
@@ -95,7 +99,7 @@ npm.cmd test
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-当前 GNU/Tauri 开发环境会使 Rust 测试二进制在启动时失败；请以 `cargo test --no-run --manifest-path src-tauri/Cargo.toml` 验证 Rust 测试编译，完整限制见 [`docs/KNOWN_LIMITATIONS.md`](./docs/KNOWN_LIMITATIONS.md)。
+Windows GNU 环境运行 Rust 测试前，请将 MinGW-w64 的 `gcc`、`windres` 和 `ar` 所在目录加入 PATH。库单元测试会链接 Windows Common Controls 清单。
 
 推送到 `main` 或创建 Pull Request 时，[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) 会在 Windows Runner 自动执行前端 lint/test/build、Rust 格式与测试编译，以及不依赖模型下载的 `core_smoke`。2026-07-19 已在干净 Windows Runner 实际通过完整质量门禁；后续结果以 GitHub Actions 页面为准。
 
@@ -104,6 +108,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 桌面壳层另有 `npm.cmd run test:e2e`：它构建前端、自动补齐本项目 GNU 工具链所需的 MinGW 路径，以 `webdriver-e2e` feature 启动临时 debug SceneWeaver，启动本地 Vite 后直接连接应用内嵌 WebDriver，验证真实窗口标题、首页渲染、从隔离临时 PNG 创建素材库并触发真实扫描、中文/空格且超过 260 字符路径的图片缩略图、损坏 PNG 不阻断任务、由真实任务中心暂停并恢复 200 个 PNG 的扫描后确认全部入库、强制结束应用后以同一 SQLite 自动恢复的 1,000 PNG 扫描任务、无 API Key 的本地关键词搜索及可解释命中原因、通过真实 Entity 页面创建别名并在搜索页离线召回素材、创建自定义选片集合后的 SQLite 持久化、从素材库镜头面板将片段加入自定义集合并在 Selects 中回读，以及从该集合点击 CSV 导出后读取实际写入的文件名与片段入点。仅该测试 feature 识别 `SCENEWEAVER_E2E_DATA_DIR`；每次运行创建并清理独立临时应用数据目录，不触碰用户数据库。E2E 为避开保存对话框而使用的临时导出路径仅存在于开发构建，production 构建不包含它；该链路不下载或使用 Edge/Chrome Driver，测试 feature 与测试夹具不会进入 release/NSIS 安装包。
 
 如已自行安装 FFmpeg，可在运行 E2E 前显式设置 `SCENEWEAVER_E2E_FFMPEG_BIN` 为本机 `ffmpeg.exe` 的完整路径；同一测试会额外生成隔离 MP4，验证视频扫描、时长和镜头片段。未设置时只跳过这项可选检查，不会下载或安装 FFmpeg。
+
+桌面 E2E 也支持本地文字验证。将测试图路径设为 `SCENEWEAVER_E2E_OCR_IMAGE`，图片需包含英文单词 LIGHTHOUSE，并在 PATH 中提供 Tesseract 和英文语言包。语音验证读取 `SCENEWEAVER_E2E_SPEECH_WAV` 和 `SCENEWEAVER_E2E_WHISPER_MODEL`，语音需包含 lighthouse。提供 Apple 的本地 1.10 DTD 路径 `SCENEWEAVER_E2E_FCPXML_DTD` 时会验证导出结构。
 
 如需运行不依赖窗口的真实核心集成验证（会在系统临时目录创建并清理测试图片），执行：
 

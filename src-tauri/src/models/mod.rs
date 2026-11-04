@@ -1,4 +1,5 @@
 pub mod asset;
+pub mod asset_text;
 pub mod common;
 pub mod entity;
 pub mod job;
@@ -8,6 +9,7 @@ pub mod segment;
 pub mod selects;
 
 pub use asset::*;
+pub use asset_text::*;
 pub use common::*;
 pub use entity::*;
 pub use job::*;

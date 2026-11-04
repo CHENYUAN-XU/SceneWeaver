@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer as createTcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
+import { createServer } from 'vite';
 import { remote } from 'webdriverio';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const appBinary = path.join(root, 'src-tauri', 'target', 'debug', 'sceneweaver.exe');
 const port = 4445;
-const devServerUrl = 'http://127.0.0.1:1420';
 
 function crc32(bytes) {
   let crc = 0xffff_ffff;
@@ -54,14 +55,45 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function runProcess(command, args, label) {
+function availableLoopbackPort() {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true });
+    const listener = createTcpServer();
+    listener.once('error', reject);
+    listener.listen(0, '127.0.0.1', () => {
+      const { port } = listener.address();
+      listener.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+function runProcess(command, args, label, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true, ...options });
     child.once('error', (error) => reject(new Error(`${label} did not start: ${error.message}`)));
     child.once('exit', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${label} exited with ${code}`));
     });
+  });
+}
+
+async function validateFcpxml(file, dtd) {
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$xml = [IO.File]::ReadAllText($env:SCENEWEAVER_E2E_XML)',
+    '$dtd = ([uri](Resolve-Path -LiteralPath $env:SCENEWEAVER_E2E_FCPXML_DTD).Path).AbsoluteUri',
+    '$xml = $xml.Replace("<!DOCTYPE fcpxml>", (\'<!DOCTYPE fcpxml SYSTEM "{0}">\' -f $dtd))',
+    '$settings = [System.Xml.XmlReaderSettings]::new()',
+    '$settings.DtdProcessing = [System.Xml.DtdProcessing]::Parse',
+    '$settings.ValidationType = [System.Xml.ValidationType]::DTD',
+    '$settings.XmlResolver = [System.Xml.XmlUrlResolver]::new()',
+    '$reader = [System.Xml.XmlReader]::Create([IO.StringReader]::new($xml), $settings)',
+    'try { while ($reader.Read()) {} } finally { $reader.Dispose() }',
+  ].join('\n');
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  await runProcess('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], 'FCPXML 1.10 DTD validation', {
+    env: { ...process.env, SCENEWEAVER_E2E_XML: file, SCENEWEAVER_E2E_FCPXML_DTD: dtd },
+    stdio: ['ignore', 'ignore', 'inherit'],
   });
 }
 
@@ -103,12 +135,12 @@ async function waitForBodyText(expected, label) {
   throw new Error(`${label} did not render ${expected}:\n${lastText}`);
 }
 
-async function waitForCompletedScan(libraryId, maxAttempts = 120) {
+async function waitForCompletedScan(libraryId, maxAttempts = 120, previousJobId) {
   let lastStatus = 'no scan job found';
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const jobs = await invoke('list_jobs');
     const job = jobs.find((candidate) => candidate.library_id === libraryId && candidate.job_type === 'scan');
-    if (job) {
+    if (job && job.id !== previousJobId) {
       lastStatus = job.status;
       if (job.status === 'completed') return job;
       if (job.status === 'failed' || job.status === 'cancelled') {
@@ -137,15 +169,8 @@ async function waitForScanStatus(libraryId, expectedStatuses, maxAttempts = 600)
   throw new Error(`fixture scan did not reach ${expectedStatuses.join(' or ')}: ${lastStatus}`);
 }
 
-const vite = spawn(process.execPath, [path.join(root, 'node_modules', 'vite', 'bin', 'vite.js'), '--host', '127.0.0.1', '--port', '1420', '--strictPort'], {
-  cwd: root,
-  stdio: 'pipe',
-  windowsHide: true,
-});
-let viteOutput = '';
-vite.stdout.on('data', (chunk) => { viteOutput += String(chunk); });
-vite.stderr.on('data', (chunk) => { viteOutput += String(chunk); });
-
+let vite;
+let vitePort;
 let app;
 let appOutput = '';
 let browser;
@@ -218,6 +243,7 @@ function launchApp() {
       ...process.env,
       ...(ffmpegPath ? { Path: `${path.dirname(ffmpegPath)};${process.env.Path ?? ''}` } : {}),
       SCENEWEAVER_E2E_DATA_DIR: appDataDir,
+      SCENEWEAVER_E2E_VITE_PORT: String(vitePort),
       TAURI_WEBDRIVER_PORT: String(port),
     },
     stdio: 'pipe',
@@ -253,7 +279,9 @@ async function restartAppAfterCrash() {
 }
 
 try {
-  await waitForUrl(devServerUrl, 'Vite development server');
+  vitePort = await availableLoopbackPort();
+  vite = await createServer({ root, server: { host: '127.0.0.1', port: vitePort, strictPort: true } });
+  await vite.listen();
   launchApp();
   await connectToApp();
 
@@ -316,7 +344,7 @@ try {
   await resumeJobButton.waitForDisplayed({ timeout: 15_000 });
   await browser.execute((element) => element.click(), resumeJobButton);
   await resumeJobButton.waitForExist({ reverse: true, timeout: 15_000 });
-  await waitForCompletedScan(pausableLibrary.id);
+  await waitForCompletedScan(pausableLibrary.id, 600);
   const pausedAssets = await invoke('list_assets', { libraryId: pausableLibrary.id });
   assert.equal(pausedAssets.length, 200, `pause/resume scan indexed ${pausedAssets.length} assets instead of 200`);
 
@@ -506,6 +534,9 @@ try {
   await (await browser.$('[data-testid="export-fcpxml"]')).click();
   const fcpxml = await readTextFileWhenReady(fcpxmlExportPath, 'custom segment FCPXML export');
   assert.ok(fcpxml.includes('<fcpxml version="1.10">'), `FCPXML export has no FCPXML root:\n${fcpxml}`);
+  assert.ok(fcpxml.includes('<media-rep kind="original-media" src="file:'), 'FCPXML 1.10 is missing its media representation');
+  const fcpxmlDtd = process.env.SCENEWEAVER_E2E_FCPXML_DTD;
+  if (fcpxmlDtd) await validateFcpxml(fcpxmlExportPath, fcpxmlDtd);
   assert.ok(fcpxml.includes('start="1500/1000s" duration="1000/1000s"'), `FCPXML export omitted the recommended range:\n${fcpxml}`);
   const scannedAssets = await invoke('list_assets', { libraryId: scannedLibrary.id });
   const sortableAsset = scannedAssets.find((asset) => asset.file_name === 'scan-fixture.png');
@@ -533,22 +564,84 @@ try {
   const orderedJson = await readTextFileWhenReady(orderedJsonPath, 'ordered custom segment JSON export');
   assert.ok(orderedJson.indexOf('scan-fixture.png') < orderedJson.indexOf('fixture.mp4'), `JSON export did not preserve UI order:\n${orderedJson}`);
   await browser.execute(() => { delete window.__SCENEWEAVER_E2E_EXPORT_PATH__; });
+
+  const watchedDirectory = path.join(appDataDir, 'watch-fixture');
+  await mkdir(watchedDirectory);
+  const watchedLibrary = await invoke('create_library', {
+    req: { name: 'E2E 自动扫描素材库', root_path: watchedDirectory, index_profile: 'balanced' },
+  });
+  await (await browser.$('[data-testid="nav-libraries"]')).click();
+  await browser.refresh();
+  const watchToggle = await browser.$(`[data-testid="watch-library-${watchedLibrary.id}"]`);
+  await watchToggle.waitForDisplayed();
+  await watchToggle.click();
+  const initialWatchScan = await waitForCompletedScan(watchedLibrary.id, 180);
+  assert.equal((await invoke('get_library', { id: watchedLibrary.id })).watch_enabled, true);
+  const watchedImage = path.join(watchedDirectory, 'watch-added.png');
+  await writeFile(watchedImage, pngFixture);
+  const addedWatchScan = await waitForCompletedScan(watchedLibrary.id, 180, initialWatchScan.id);
+  let watchedAssets = await invoke('list_assets', { libraryId: watchedLibrary.id });
+  assert.equal(watchedAssets[0]?.file_name, 'watch-added.png');
+  assert.equal(watchedAssets[0]?.status, 'indexed');
+  await rm(watchedImage);
+  await waitForCompletedScan(watchedLibrary.id, 180, addedWatchScan.id);
+  watchedAssets = await invoke('list_assets', { libraryId: watchedLibrary.id });
+  assert.equal(watchedAssets[0]?.status, 'offline');
+  await watchToggle.click();
+  await browser.waitUntil(async () => !(await invoke('get_library', { id: watchedLibrary.id })).watch_enabled);
+  console.log('desktop e2e passed: opt-in automatic scan indexed a new PNG and marked it offline on removal');
+
+  const speechModel = process.env.SCENEWEAVER_E2E_WHISPER_MODEL;
+  const speechFixture = process.env.SCENEWEAVER_E2E_SPEECH_WAV;
+  const ocrFixture = process.env.SCENEWEAVER_E2E_OCR_IMAGE;
+  if ((speechModel && speechFixture) || ocrFixture) {
+    const textDirectory = path.join(appDataDir, 'text-fixture');
+    await mkdir(textDirectory);
+    if (speechModel && speechFixture) await writeFile(path.join(textDirectory, 'voice.wav'), await readFile(speechFixture));
+    if (ocrFixture) await writeFile(path.join(textDirectory, 'printed.png'), await readFile(ocrFixture));
+    const textLibrary = await invoke('create_library', {
+      req: { name: 'E2E 本地文字素材库', root_path: textDirectory, index_profile: 'balanced' },
+    });
+    await invoke('start_scan', { libraryId: textLibrary.id });
+    await waitForCompletedScan(textLibrary.id);
+    const textAssets = await invoke('list_assets', { libraryId: textLibrary.id });
+    const ocrAsset = textAssets.find((asset) => asset.file_name === 'printed.png');
+    const speechAsset = textAssets.find((asset) => asset.file_name === 'voice.wav');
+    if (ocrAsset) {
+      await browser.refresh();
+      const textLibraryLink = await browser.$(`[data-testid="open-library-${textLibrary.id}"]`);
+      await textLibraryLink.waitForDisplayed();
+      await textLibraryLink.click();
+      const imageCard = await browser.$(`[data-asset-id="${ocrAsset.id}"]`);
+      await imageCard.moveTo();
+      await (await imageCard.$('button[title="查看和分析本地文字"]')).click();
+      await (await browser.$('button=识别文字')).click();
+      await waitForBodyText('LIGHTHOUSE', 'OCR fixture text');
+    }
+    if (speechAsset) {
+      const cues = await invoke('analyze_asset_text', { assetId: speechAsset.id, source: 'speech', modelPath: speechModel });
+      assert.ok(cues.some((cue) => /lighthouse/i.test(cue.text) && cue.end_ms > cue.start_ms),
+        `speech transcript missing the fixture word and time range: ${JSON.stringify(cues)}`);
+    }
+    await (await browser.$('[data-testid="nav-search"]')).click();
+    await (await browser.$('input[placeholder="例如：雨夜、角色、采访"]')).setValue('lighthouse');
+    await (await browser.$('button=搜索')).click();
+    if (ocrAsset) await waitForBodyText('命中画面文字：lighthouse', 'OCR search explanation');
+    if (speechAsset) await waitForBodyText('命中语音转写：lighthouse', 'speech search explanation');
+    console.log('desktop e2e passed: local text is indexed and its source is shown in search results');
+  }
+
   console.log(`desktop e2e passed: application launch, real PNG library scan, Chinese/spaced long-path and corrupt-media resilience, pause/resume scan workflow, crash recovery scan workflow${ffmpegPath ? ', real video scan' : ''}, no-API-key keyword, reference-image, and entity alias/positive-negative reference search, custom Selects persistence, custom segment selects, sorting, and CSV/JSON/EDL/FCPXML export`);
 } finally {
   await browser?.deleteSession().catch(() => undefined);
   app?.kill();
-  vite.kill();
   await Promise.all([
     app ? Promise.race([new Promise((resolve) => app.once('exit', resolve)), delay(5_000)]) : Promise.resolve(),
-    Promise.race([new Promise((resolve) => vite.once('exit', resolve)), delay(5_000)]),
+    vite?.close(),
   ]);
   if (app?.exitCode === null) app.kill('SIGKILL');
-  if (vite.exitCode === null) vite.kill('SIGKILL');
   if (app && app.exitCode !== 0 && app.exitCode !== null) {
     console.error(`SceneWeaver exited with ${app.exitCode}: ${appOutput}`);
-  }
-  if (vite && vite.exitCode !== 0 && vite.exitCode !== null) {
-    console.error(`Vite exited with ${vite.exitCode}: ${viteOutput}`);
   }
   await rm(appDataDir, { recursive: true, force: true });
 }

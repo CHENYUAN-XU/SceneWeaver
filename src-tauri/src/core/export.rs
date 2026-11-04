@@ -245,28 +245,13 @@ pub fn write_select_items_fcpxml(path: &Path, items: &[SelectItem]) -> AppResult
         .find_map(|item| valid_fps(item.asset.fps))
         .unwrap_or(30.0);
     let mut output = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.10\"><resources><format id=\"format-timeline\" frameDuration=\"{}\" width=\"1920\" height=\"1080\"/>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\"><resources><format id=\"format-timeline\" frameDuration=\"{}\" width=\"1920\" height=\"1080\"/>\n",
         fcpx_frame_duration(timeline_fps)
     );
     for (index, item) in items.iter().enumerate() {
         let (_, end) = select_range(item);
         let source_duration = item.asset.duration_ms.unwrap_or(end).max(end).max(1);
-        let format_id = format!("format-asset-{}", index + 1);
-        let format_attribute = if item.asset.media_type.as_str() == "audio" {
-            String::new()
-        } else {
-            output.push_str(&fcpx_format_resource(&format_id, &item.asset));
-            format!(" format=\"{format_id}\"")
-        };
-        output.push_str(&format!(
-            "<asset id=\"asset-{}\" name=\"{}\" src=\"{}\" start=\"0s\" duration=\"{}\"{} {}/>\n",
-            index + 1,
-            xml_escape(&item.asset.file_name),
-            file_url(&item.asset.file_path),
-            fcpx_duration(source_duration),
-            format_attribute,
-            fcpx_media_attributes(&item.asset)
-        ));
+        append_fcpx_asset(&mut output, index + 1, &item.asset, source_duration);
     }
     output.push_str(&format!("</resources><library><event name=\"SceneWeaver\"><project name=\"SceneWeaver Selects\"><sequence duration=\"{}\" format=\"format-timeline\"><spine>\n", fcpx_duration(total_ms)));
     let mut offset = 0_i64;
@@ -398,26 +383,16 @@ pub fn write_fcpxml(path: &Path, assets: &[Asset]) -> AppResult<()> {
         .find_map(|asset| valid_fps(asset.fps))
         .unwrap_or(30.0);
     let mut output = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.10\"><resources><format id=\"format-timeline\" frameDuration=\"{}\" width=\"1920\" height=\"1080\"/>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\"><resources><format id=\"format-timeline\" frameDuration=\"{}\" width=\"1920\" height=\"1080\"/>\n",
         fcpx_frame_duration(timeline_fps)
     );
     for (index, asset) in assets.iter().enumerate() {
-        let format_id = format!("format-asset-{}", index + 1);
-        let format_attribute = if asset.media_type.as_str() == "audio" {
-            String::new()
-        } else {
-            output.push_str(&fcpx_format_resource(&format_id, asset));
-            format!(" format=\"{format_id}\"")
-        };
-        output.push_str(&format!(
-            "<asset id=\"asset-{}\" name=\"{}\" src=\"{}\" start=\"0s\" duration=\"{}\"{} {}/>\n",
+        append_fcpx_asset(
+            &mut output,
             index + 1,
-            xml_escape(&asset.file_name),
-            file_url(&asset.file_path),
-            fcpx_duration(asset.duration_ms.unwrap_or(0)),
-            format_attribute,
-            fcpx_media_attributes(asset)
-        ));
+            asset,
+            asset.duration_ms.unwrap_or(0),
+        );
     }
     output.push_str(&format!("</resources><library><event name=\"SceneWeaver\"><project name=\"SceneWeaver Selects\"><sequence duration=\"{}\" format=\"format-timeline\"><spine>\n", fcpx_duration(total_ms)));
     let mut offset = 0_i64;
@@ -439,6 +414,24 @@ pub fn write_fcpxml(path: &Path, assets: &[Asset]) -> AppResult<()> {
 
 fn fcpx_duration(milliseconds: i64) -> String {
     format!("{}/1000s", milliseconds.max(0))
+}
+
+fn append_fcpx_asset(output: &mut String, index: usize, asset: &Asset, duration_ms: i64) {
+    let format_id = format!("format-asset-{index}");
+    let format_attribute = if asset.media_type.as_str() == "audio" {
+        String::new()
+    } else {
+        output.push_str(&fcpx_format_resource(&format_id, asset));
+        format!(" format=\"{format_id}\"")
+    };
+    output.push_str(&format!(
+        "<asset id=\"asset-{index}\" name=\"{}\" start=\"0s\" duration=\"{}\"{} {}><media-rep kind=\"original-media\" src=\"{}\"/></asset>\n",
+        xml_escape(&asset.file_name),
+        fcpx_duration(duration_ms),
+        format_attribute,
+        fcpx_media_attributes(asset),
+        file_url(&asset.file_path),
+    ));
 }
 
 fn valid_fps(fps: Option<f64>) -> Option<f64> {
@@ -477,15 +470,29 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 fn file_url(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let (prefix, path) = if let Some(unc) = normalized.strip_prefix("//?/UNC/").or_else(|| {
+        normalized
+            .strip_prefix("//")
+            .filter(|path| !path.starts_with("?/"))
+    }) {
+        ("file://", unc)
+    } else if let Some(path) = normalized.strip_prefix("//?/") {
+        ("file:///", path)
+    } else if normalized.starts_with('/') {
+        ("file://", normalized.as_str())
+    } else {
+        ("file:///", normalized.as_str())
+    };
     let mut encoded = String::new();
-    for byte in path.replace('\\', "/").bytes() {
+    for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
         }
     }
-    format!("file:///{encoded}")
+    format!("{prefix}{encoded}")
 }
 
 fn fcpx_media_attributes(asset: &Asset) -> &'static str {

@@ -110,6 +110,23 @@ describe('Search page interactions', () => {
     });
   });
 
+  it('replaces reference image results when submitting a keyword query', async () => {
+    open.mockResolvedValue('C:\\fixtures\\reference-fixture.png');
+    findSimilarByReferenceImage.mockResolvedValue([{ id: 'reference-match' }]);
+    searchAssets.mockResolvedValue([]);
+    const user = userEvent.setup();
+    renderSearch();
+
+    await user.click(screen.getByRole('button', { name: '参考图' }));
+    expect(await screen.findByText('参考图相似结果：1 项')).toBeTruthy();
+
+    await user.type(screen.getByPlaceholderText('例如：雨夜、角色、采访'), '雨夜');
+    await user.click(screen.getByRole('button', { name: '搜索' }));
+
+    expect(await screen.findByText('关键词结果：0 项')).toBeTruthy();
+    expect(screen.queryByText('参考图相似结果：1 项')).toBeNull();
+  });
+
   it('blocks a query whose start date is later than its end date', async () => {
     searchAssets.mockResolvedValue([]);
     const user = userEvent.setup();

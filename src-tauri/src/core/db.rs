@@ -8,6 +8,10 @@ use crate::core::fingerprint::quick_fingerprint;
 use crate::core::scanner::normalize_path;
 use crate::models::*;
 
+const MATCH_ASSET_TERM: &str = "(file_name LIKE ? ESCAPE '\\' OR file_path LIKE ? ESCAPE '\\'
+    OR EXISTS (SELECT 1 FROM tags WHERE scope_type = 'asset' AND scope_id = assets.id AND namespace = 'acg_creator' AND value LIKE ? ESCAPE '\\')
+    OR EXISTS (SELECT 1 FROM asset_text WHERE asset_id = assets.id AND fingerprint = assets.quick_fingerprint AND body LIKE ? ESCAPE '\\'))";
+
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
@@ -125,6 +129,18 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_library_watch_enabled(&self, id: &str, enabled: bool) -> AppResult<()> {
+        let conn = self.open()?;
+        let updated = conn.execute(
+            "UPDATE libraries SET watch_enabled = ?1, updated_at = ?2 WHERE id = ?3",
+            params![enabled, chrono::Utc::now().timestamp_millis(), id],
+        )?;
+        if updated == 0 {
+            return Err(AppError::LibraryNotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
     pub fn update_library_status(
         &self,
         id: &str,
@@ -203,15 +219,25 @@ impl Database {
             params![now, library_id],
         )?;
         for (asset, canonical, normalized_path, size_bytes, modified_at) in &rebased {
-            let status = if asset.status == AssetStatus::Offline {
+            let changed = asset.size_bytes != *size_bytes || asset.modified_at != *modified_at;
+            let status = if changed {
+                AssetStatus::Pending
+            } else if asset.status == AssetStatus::Offline {
                 AssetStatus::Indexed
             } else {
                 asset.status.clone()
             };
+            let rebased_fingerprint =
+                quick_fingerprint(normalized_path, asset.size_bytes as u64, asset.modified_at);
+            if !changed {
+                transaction.execute(
+                    "UPDATE asset_text SET fingerprint = ?1 WHERE asset_id = ?2 AND fingerprint = ?3",
+                    params![rebased_fingerprint, asset.id, asset.quick_fingerprint],
+                )?;
+            }
             transaction.execute(
                 "UPDATE assets SET file_path = ?1, normalized_path = ?2, file_name = ?3,
-                    size_bytes = ?4, modified_at = ?5, quick_fingerprint = ?6, status = ?7,
-                    updated_at = ?8 WHERE id = ?9",
+                    quick_fingerprint = ?4, status = ?5, updated_at = ?6 WHERE id = ?7",
                 params![
                     canonical.to_string_lossy().to_string(),
                     normalized_path,
@@ -219,9 +245,7 @@ impl Database {
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_default(),
-                    size_bytes,
-                    modified_at,
-                    quick_fingerprint(normalized_path, *size_bytes as u64, *modified_at),
+                    rebased_fingerprint,
                     status.as_str(),
                     now,
                     asset.id,
@@ -438,6 +462,64 @@ impl Database {
         Ok(())
     }
 
+    pub fn store_asset_text(
+        &self,
+        asset: &Asset,
+        source: AssetTextSource,
+        cues: &[TextCue],
+    ) -> AppResult<()> {
+        let conn = self.open()?;
+        let body = cues
+            .iter()
+            .map(|cue| cue.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let updated = conn.execute(
+            "INSERT INTO asset_text (asset_id, source, fingerprint, body, cues_json)
+             SELECT id, ?2, quick_fingerprint, ?4, ?5 FROM assets
+             WHERE id = ?1 AND quick_fingerprint = ?3 AND status = 'indexed'
+             ON CONFLICT(asset_id, source) DO UPDATE SET fingerprint = excluded.fingerprint,
+               body = excluded.body, cues_json = excluded.cues_json",
+            params![
+                asset.id,
+                source.as_str(),
+                asset.quick_fingerprint,
+                body,
+                serde_json::to_string(cues)?
+            ],
+        )?;
+        if updated == 0 {
+            return Err(AppError::Other("素材已变更，请重新扫描后再分析".into()));
+        }
+        Ok(())
+    }
+
+    pub fn list_asset_text(
+        &self,
+        asset_id: &str,
+        source: AssetTextSource,
+    ) -> AppResult<Vec<TextCue>> {
+        let conn = self.open()?;
+        let json = conn.query_row(
+            "SELECT text.cues_json FROM asset_text text JOIN assets ON assets.id = text.asset_id
+             WHERE text.asset_id = ?1 AND text.source = ?2 AND text.fingerprint = assets.quick_fingerprint",
+            params![asset_id, source.as_str()],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        match json {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn delete_asset_text(&self, asset_id: &str, source: AssetTextSource) -> AppResult<()> {
+        self.open()?.execute(
+            "DELETE FROM asset_text WHERE asset_id = ?1 AND source = ?2",
+            params![asset_id, source.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn search_assets(&self, query: &str, limit: usize) -> AppResult<Vec<Asset>> {
         let normalized_query = query.trim();
         if normalized_query.is_empty() {
@@ -496,11 +578,9 @@ impl Database {
                 score_sql.push_str(" THEN 1 ELSE 0 END");
                 continue;
             }
-            score_sql.push_str(" + CASE WHEN (file_name LIKE ? ESCAPE '\\' OR file_path LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM tags WHERE scope_type = 'asset' AND scope_id = assets.id AND namespace = 'acg_creator' AND value LIKE ? ESCAPE '\\')) THEN 1 ELSE 0 END");
-            let pattern = search_pattern(term);
-            score_values.push(pattern.clone().into());
-            score_values.push(pattern.clone().into());
-            score_values.push(pattern.into());
+            score_sql.push_str(" + CASE WHEN ");
+            append_asset_term(&mut score_sql, &mut score_values, term);
+            score_sql.push_str(" THEN 1 ELSE 0 END");
         }
         let mut sql = format!("SELECT id, library_id, media_type, file_path, normalized_path, file_name, extension, size_bytes, modified_at, quick_fingerprint, full_hash, duration_ms, width, height, fps, codec, capture_time, status, index_level, analysis_version, created_at, updated_at, ({score_sql}) AS relevance FROM assets WHERE status = 'indexed'");
         let mut values = Vec::<rusqlite::types::Value>::new();
@@ -533,21 +613,15 @@ impl Database {
             sql.push_str(&predicate);
         }
         for term in must {
-            sql.push_str(" AND (file_name LIKE ? ESCAPE '\\' OR file_path LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM tags WHERE scope_type = 'asset' AND scope_id = assets.id AND namespace = 'acg_creator' AND value LIKE ? ESCAPE '\\'))");
-            let pattern = search_pattern(&term);
-            values.push(pattern.clone().into());
-            values.push(pattern.clone().into());
-            values.push(pattern.into());
+            sql.push_str(" AND ");
+            append_asset_term(&mut sql, &mut values, &term);
         }
         for term in &request.must_not {
             if segment_label_for_term(term).is_some() {
                 continue;
             }
-            sql.push_str(" AND NOT (file_name LIKE ? ESCAPE '\\' OR file_path LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM tags WHERE scope_type = 'asset' AND scope_id = assets.id AND namespace = 'acg_creator' AND value LIKE ? ESCAPE '\\'))");
-            let pattern = search_pattern(term);
-            values.push(pattern.clone().into());
-            values.push(pattern.clone().into());
-            values.push(pattern.into());
+            sql.push_str(" AND NOT ");
+            append_asset_term(&mut sql, &mut values, term);
         }
         sql.push_str(" ORDER BY relevance DESC, modified_at DESC LIMIT ?");
         score_values.append(&mut values);
@@ -613,11 +687,8 @@ impl Database {
             if segment_label_for_term(term).is_some() {
                 continue;
             }
-            sql.push_str(" AND NOT (file_name LIKE ? ESCAPE '\\' OR file_path LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM tags WHERE scope_type = 'asset' AND scope_id = assets.id AND namespace = 'acg_creator' AND value LIKE ? ESCAPE '\\'))");
-            let pattern = search_pattern(term);
-            values.push(pattern.clone().into());
-            values.push(pattern.clone().into());
-            values.push(pattern.into());
+            sql.push_str(" AND NOT ");
+            append_asset_term(&mut sql, &mut values, term);
         }
         sql.push_str(" ORDER BY modified_at DESC LIMIT ?");
         values.push((limit as i64).into());
@@ -657,6 +728,7 @@ impl Database {
             "DELETE FROM asset_embeddings WHERE asset_id = ?1",
             [asset_id],
         )?;
+        transaction.execute("DELETE FROM asset_text WHERE asset_id = ?1", [asset_id])?;
         transaction.execute(
             "DELETE FROM entity_reference_embeddings WHERE reference_id IN (SELECT id FROM entity_references WHERE asset_id = ?1)",
             [asset_id],
@@ -1973,6 +2045,12 @@ fn segment_labels_predicate(
     ))
 }
 
+fn append_asset_term(sql: &mut String, values: &mut Vec<rusqlite::types::Value>, term: &str) {
+    sql.push_str(MATCH_ASSET_TERM);
+    let pattern = rusqlite::types::Value::from(search_pattern(term));
+    values.extend(std::iter::repeat_n(pattern, 4));
+}
+
 fn search_pattern(term: &str) -> String {
     format!(
         "%{}%",
@@ -2094,8 +2172,7 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {
         create_schema(conn)?;
-        conn.execute_batch("PRAGMA user_version = 9;")?;
-        return Ok(());
+        return migrate_asset_text(conn);
     }
 
     if version < 2 {
@@ -2125,6 +2202,26 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 9 {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS hidden_assets (asset_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE); PRAGMA user_version = 9;")?;
     }
+    if version < 10 {
+        migrate_asset_text(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_asset_text(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS asset_text (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            body TEXT NOT NULL,
+            cues_json TEXT NOT NULL,
+            PRIMARY KEY (asset_id, source)
+         );
+         PRAGMA user_version = 10;
+         COMMIT;",
+    )?;
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::core::error::{AppError, AppResult};
+use crate::core::media_tools::MediaTool;
 use crate::models::MediaProbeInfo;
 
 #[derive(Debug, Deserialize, Default)]
@@ -39,7 +40,9 @@ struct FfprobeStream {
 }
 
 pub fn probe_media(path: &Path) -> AppResult<MediaProbeInfo> {
-    let ffprobe_exe = find_ffprobe()?;
+    let ffprobe_exe = MediaTool::Ffprobe
+        .find()
+        .ok_or_else(|| AppError::FfprobeUnavailable("未找到 ffprobe，请安装 FFmpeg".to_string()))?;
 
     let mut command = Command::new(ffprobe_exe);
     command
@@ -117,10 +120,18 @@ pub fn run_command_with_timeout(
     timeout_message: &str,
 ) -> AppResult<std::process::Output> {
     let mut child = command.spawn()?;
+    // Drain both pipes while the child is alive. FFmpeg can emit more than a
+    // pipe buffer of diagnostics, especially during full-length scene detection.
+    let stdout = child.stdout.take().map(read_pipe);
+    let stderr = child.stderr.take().map(read_pipe);
     let deadline = Instant::now() + timeout;
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(AppError::from);
+        if let Some(status) = child.try_wait()? {
+            return Ok(std::process::Output {
+                status,
+                stdout: collect_pipe(stdout)?,
+                stderr: collect_pipe(stderr)?,
+            });
         }
         if Instant::now() >= deadline {
             if let Err(error) = child.kill() {
@@ -132,6 +143,27 @@ pub fn run_command_with_timeout(
             return Err(AppError::FfprobeUnavailable(timeout_message.to_string()));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn read_pipe(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut data = Vec::new();
+        pipe.read_to_end(&mut data)?;
+        Ok(data)
+    })
+}
+
+fn collect_pipe(
+    reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> AppResult<Vec<u8>> {
+    match reader {
+        Some(reader) => Ok(reader
+            .join()
+            .map_err(|_| AppError::Other("读取子进程输出失败".into()))??),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -176,31 +208,6 @@ fn parse_frame_rate(rate: &String) -> Option<f64> {
         return Some(num / den);
     }
     rate.parse().ok()
-}
-
-fn find_ffprobe() -> AppResult<String> {
-    // 优先检测 PATH
-    if let Ok(found) = which::which("ffprobe") {
-        return Ok(found.to_string_lossy().to_string());
-    }
-    if let Ok(found) = which::which("ffprobe.exe") {
-        return Ok(found.to_string_lossy().to_string());
-    }
-
-    // 常见 Windows 安装位置
-    let candidates = [
-        r"C:\Program Files\FFmpeg\bin\ffprobe.exe",
-        r"C:\Program Files (x86)\FFmpeg\bin\ffprobe.exe",
-    ];
-    for c in &candidates {
-        if Path::new(c).exists() {
-            return Ok(c.to_string());
-        }
-    }
-
-    Err(AppError::FfprobeUnavailable(
-        "未找到 ffprobe，请在设置中配置或安装 FFmpeg".to_string(),
-    ))
 }
 
 #[cfg(test)]

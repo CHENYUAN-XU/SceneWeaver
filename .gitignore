@@ -4,6 +4,7 @@ dist/
 
 # Rust/Tauri build output and local logs
 src-tauri/target/
+src-tauri/vendor/ffmpeg/
 *.log
 
 # OS/editor noise
